@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Self-Healing Demo - Checkout v1</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #f8fafc;
+        color: #0f172a;
+        padding: 40px;
+        margin: 0;
+      }
+      .card {
+        max-width: 520px;
+        margin: 0 auto;
+        background: #fff;
+        padding: 32px;
+        border-radius: 10px;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+      }
+      h1 { margin: 0 0 6px; color: #1e293b; font-size: 22px; }
+      .sub { color: #64748b; margin-bottom: 24px; font-size: 14px; }
+      label { display: block; font-weight: 600; margin: 14px 0 6px; color: #334155; font-size: 14px; }
+      input {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        font-size: 14px;
+      }
+      input:focus { outline: 2px solid #2563eb; outline-offset: 1px; }
+      .row { display: flex; gap: 12px; margin-top: 20px; }
+      button {
+        flex: 1;
+        padding: 11px 16px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .submit-btn { background: #2563eb; color: white; }
+      .submit-btn:hover { background: #1d4ed8; }
+      .cancel-btn { background: #e2e8f0; color: #475569; }
+      .cancel-btn:hover { background: #cbd5e1; }
+      .status {
+        margin-top: 18px;
+        font-weight: 600;
+        color: #166534;
+        min-height: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Checkout (v1 - Original)</h1>
+      <div class="sub">Seed run – this layout is used to capture metadata.</div>
+
+      <form id="order-form">
+        <label for="email-field">Email address</label>
+        <input
+          id="email-field"
+          name="email"
+          class="input-field email"
+          type="email"
+          placeholder="you@example.com"
+        />
+
+        <label for="coupon-field">Coupon code</label>
+        <input
+          id="coupon-field"
+          name="coupon"
+          class="input-field coupon"
+          type="text"
+          placeholder="SAVE10"
+        />
+
+        <div class="row">
+          <button
+            id="submit-order"
+            class="submit-btn primary-action"
+            data-testid="checkout-submit"
+            type="button"
+          >
+            Submit Order
+          </button>
+          <button id="cancel-order" class="cancel-btn" type="button">Cancel</button>
+        </div>
+      </form>
+
+      <p id="status-message" class="status"></p>
+    </div>
+
+    <script>
+      document.getElementById('submit-order').addEventListener('click', () => {
+        const email = document.getElementById('email-field').value;
+        const msg = document.getElementById('status-message');
+        msg.textContent = email
+          ? `Order submitted successfully for ${email}!`
+          : 'Order submitted successfully!';
+      });
+      document.getElementById('cancel-order').addEventListener('click', () => {
+        document.getElementById('status-message').textContent = 'Order cancelled.';
+      });
+    </script>
+  </body>
+</html>

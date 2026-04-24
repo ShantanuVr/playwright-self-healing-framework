@@ -1,0 +1,445 @@
+/**
+ * @file SmartPage.ts
+ * @description Custom Action Wrapper that sits in front of Playwright's
+ *              {@link Page} and makes every interaction "self-healing".
+ *
+ *              Responsibilities:
+ *               1. Resolve the effective primary selector for a logical
+ *                  element name – preferring the last successfully used
+ *                  selector from storage over hard-coded hints.
+ *               2. Attempt the action with the primary selector first.
+ *               3. On a Playwright TimeoutError (or any locator-related
+ *                  error), hand the current DOM off to the
+ *                  {@link SelfHealingEngine}, receive a healed selector,
+ *                  retry the action, and persist the new selector.
+ *               4. On every success, capture fresh {@link ElementMetaData}
+ *                  so the "training data" stays in sync with production.
+ *               5. Delegate logging to the {@link StateReporter} – this
+ *                  class never prints or asserts on its own.
+ *
+ * SOLID notes:
+ *  - SRP: orchestration only; similarity math, storage, and reporting are
+ *    injected collaborators.
+ *  - OCP / DIP: depends on {@link IMetadataStore} (abstraction), not on
+ *    JsonMetadataStore.
+ *  - Assertions are untouched – callers use `expect()` on `page.raw` or on
+ *    `expectVisible()`. The healing logic never throws its own assertion.
+ */
+
+import { Page, Locator, errors as pwErrors, expect } from '@playwright/test';
+import { IMetadataStore } from '../storage/IMetadataStore';
+import {
+  ElementMetaData,
+  HealingOutcome,
+  AnchorContext,
+} from '../storage/ElementMetaData';
+import { SelfHealingEngine } from '../healing/SelfHealingEngine';
+import { StateReporter } from '../reporting/StateReporter';
+
+export interface SmartPageOptions {
+  store: IMetadataStore;
+  engine: SelfHealingEngine;
+  reporter: StateReporter;
+  /** Per-action timeout in ms (default 4000). */
+  defaultTimeoutMs?: number;
+  /**
+   * Controls whether successful interactions update the metadata store.
+   * - `auto` (default): always capture.
+   * - `readonly`: never write to the store (useful for audit runs).
+   */
+  captureMode?: 'auto' | 'readonly';
+}
+
+/** The action operates on a resolved Playwright {@link Locator}. */
+type InteractionFn = (locator: Locator) => Promise<void>;
+
+/**
+ * Snapshot harvested from the browser during `captureMetadata`.
+ * Mirrors – but is NOT identical to – {@link ElementMetaData} because it
+ * omits persistence-only fields (logicalName, primarySelector).
+ */
+interface DomSnapshot {
+  tagName: string;
+  id?: string;
+  classes: string[];
+  textContent: string;
+  attributes: Record<string, string>;
+  anchor: AnchorContext;
+}
+
+export class SmartPage {
+  private readonly page: Page;
+  private readonly store: IMetadataStore;
+  private readonly engine: SelfHealingEngine;
+  private readonly reporter: StateReporter;
+  private readonly timeout: number;
+  private readonly captureMode: 'auto' | 'readonly';
+  private readonly registry: Map<string, string> = new Map();
+
+  constructor(page: Page, options: SmartPageOptions) {
+    this.page = page;
+    this.store = options.store;
+    this.engine = options.engine;
+    this.reporter = options.reporter;
+    this.timeout = options.defaultTimeoutMs ?? 4_000;
+    this.captureMode = options.captureMode ?? 'auto';
+  }
+
+  /** Escape hatch – the raw Playwright page for anything we don't wrap. */
+  public get raw(): Page {
+    return this.page;
+  }
+
+  /**
+   * Register a static mapping `logicalName → selector` (used when no
+   * inline hint is passed and storage has no entry yet).
+   */
+  public register(logicalName: string, selector: string): void {
+    this.registry.set(logicalName, selector);
+  }
+
+  // --------------------------------------------------------------------
+  // Public interaction API
+  // --------------------------------------------------------------------
+
+  public async click(logicalName: string, selectorHint?: string): Promise<void> {
+    await this.perform(logicalName, selectorHint, async (loc) => {
+      await loc.click({ timeout: this.timeout });
+    });
+  }
+
+  public async fill(
+    logicalName: string,
+    value: string,
+    selectorHint?: string,
+  ): Promise<void> {
+    await this.perform(logicalName, selectorHint, async (loc) => {
+      await loc.fill(value, { timeout: this.timeout });
+    });
+  }
+
+  public async text(logicalName: string, selectorHint?: string): Promise<string> {
+    let result = '';
+    await this.perform(logicalName, selectorHint, async (loc) => {
+      result = (await loc.textContent({ timeout: this.timeout })) ?? '';
+    });
+    return result;
+  }
+
+  public async expectVisible(
+    logicalName: string,
+    selectorHint?: string,
+  ): Promise<void> {
+    await this.perform(logicalName, selectorHint, async (loc) => {
+      await expect(loc).toBeVisible({ timeout: this.timeout });
+    });
+  }
+
+  // --------------------------------------------------------------------
+  // Core orchestration
+  // --------------------------------------------------------------------
+
+  private async perform(
+    logicalName: string,
+    selectorHint: string | undefined,
+    action: InteractionFn,
+  ): Promise<void> {
+    await this.store.load();
+
+    const primary = this.resolvePrimary(logicalName, selectorHint);
+    if (!primary) {
+      throw new Error(
+        `[SmartPage] No selector available for logical name "${logicalName}". ` +
+          `Provide a selectorHint, call register(), or seed metadata first.`,
+      );
+    }
+
+    const startedAt = Date.now();
+    try {
+      const locator = this.page.locator(primary).first();
+      await action(locator);
+      // Success – refresh the training data so future mutations can still heal.
+      if (this.captureMode === 'auto') {
+        await this.captureMetadata(logicalName, primary, locator);
+      }
+      this.reporter.record({
+        logicalName,
+        originalSelector: primary,
+        healedSelector: primary,
+        confidence: 1,
+        strategy: 'exact',
+        durationMs: Date.now() - startedAt,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    } catch (err) {
+      if (!this.isInteractionError(err)) throw err;
+
+      const outcome = await this.attemptHeal(logicalName, primary, action);
+      outcome.durationMs = Date.now() - startedAt;
+      this.reporter.record(outcome);
+
+      if (outcome.strategy === 'failed') {
+        // Re-throw a decorated version of the original error so users still
+        // see the full Playwright context (including trace), but with the
+        // healing diagnostics attached.
+        const reason = outcome.reason ?? 'unknown heal failure';
+        (err as Error).message =
+          `${(err as Error).message}\n[SelfHealing] ${reason}`;
+        throw err;
+      }
+    }
+  }
+
+  private resolvePrimary(
+    logicalName: string,
+    selectorHint: string | undefined,
+  ): string | undefined {
+    // Storage wins – that selector is known to have worked most recently
+    // (or was just healed). Falls back to registry, then inline hint.
+    return (
+      this.store.get(logicalName)?.primarySelector ??
+      this.registry.get(logicalName) ??
+      selectorHint
+    );
+  }
+
+  /**
+   * Try to recover a broken interaction by handing the current DOM to the
+   * healing engine. Always returns a {@link HealingOutcome} – never throws.
+   */
+  private async attemptHeal(
+    logicalName: string,
+    failedSelector: string,
+    action: InteractionFn,
+  ): Promise<HealingOutcome> {
+    const meta = this.store.get(logicalName);
+    const timestamp = new Date().toISOString();
+
+    if (!meta) {
+      return {
+        logicalName,
+        originalSelector: failedSelector,
+        confidence: 0,
+        strategy: 'failed',
+        reason:
+          'No historical metadata for this logical name – nothing to heal from.',
+        durationMs: 0,
+        timestamp,
+      };
+    }
+
+    let domHtml: string;
+    try {
+      domHtml = await this.page.content();
+    } catch (contentErr) {
+      return {
+        logicalName,
+        originalSelector: failedSelector,
+        confidence: 0,
+        strategy: 'failed',
+        reason: `Unable to read page.content(): ${(contentErr as Error).message}`,
+        durationMs: 0,
+        timestamp,
+      };
+    }
+
+    const result = this.engine.heal(domHtml, meta);
+
+    if (!result.healed || !result.selector) {
+      return {
+        logicalName,
+        originalSelector: failedSelector,
+        confidence: result.confidence,
+        strategy: 'failed',
+        reason:
+          `No DOM candidate met the confidence threshold. ` +
+          `Best score=${result.confidence.toFixed(3)} ` +
+          `across ${result.candidatesEvaluated} candidates.`,
+        durationMs: 0,
+        timestamp,
+      };
+    }
+
+    // Try the primary (CSS) healed selector first; if that throws at click
+    // time (e.g. the CSS form became ambiguous), fall back to the XPath
+    // expression that the engine produced for the same candidate.
+    const attempts: Array<{ locatorExpr: string; kind: 'css' | 'xpath' }> = [
+      { locatorExpr: result.selector, kind: 'css' },
+    ];
+    if (result.candidate?.xpath) {
+      attempts.push({ locatorExpr: `xpath=${result.candidate.xpath}`, kind: 'xpath' });
+    }
+
+    let lastError: Error | undefined;
+    for (const attempt of attempts) {
+      try {
+        const healedLocator = this.page.locator(attempt.locatorExpr).first();
+        await action(healedLocator);
+
+        // Refresh the stored fingerprint from the healed node's CURRENT
+        // DOM state. Without this, anchor context (siblings, label,
+        // attributes) remains anchored to the original UI and each
+        // additional mutation would score against stale "training data".
+        if (this.captureMode === 'auto') {
+          await this.captureMetadata(
+            logicalName,
+            attempt.locatorExpr,
+            healedLocator,
+          );
+        } else {
+          await this.store.upsert({
+            ...meta,
+            primarySelector: attempt.locatorExpr,
+            capturedAt: new Date().toISOString(),
+          });
+        }
+
+        // Append the broken selector to the rolling audit trail.
+        const refreshed = this.store.get(logicalName) ?? meta;
+        const healedFrom = Array.from(
+          new Set([...(refreshed.healedFrom ?? []), failedSelector]),
+        ).slice(-10);
+        await this.store.upsert({ ...refreshed, healedFrom });
+
+        return {
+          logicalName,
+          originalSelector: failedSelector,
+          healedSelector: attempt.locatorExpr,
+          confidence: result.confidence,
+          strategy: 'healed',
+          reason:
+            `Matched "${result.candidate?.textContent ?? ''}" ` +
+            `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}.`,
+          durationMs: 0,
+          timestamp,
+        };
+      } catch (retryErr) {
+        lastError = retryErr as Error;
+      }
+    }
+
+    return {
+      logicalName,
+      originalSelector: failedSelector,
+      healedSelector: result.selector,
+      confidence: result.confidence,
+      strategy: 'failed',
+      reason:
+        `Healed selector(s) failed on retry: ${lastError?.message ?? 'unknown'}`,
+      durationMs: 0,
+      timestamp,
+    };
+  }
+
+  /**
+   * Detect errors that indicate the locator is broken, as opposed to true
+   * application errors we must not swallow. We prefer `instanceof
+   * TimeoutError` but fall back to a message heuristic because some error
+   * types get re-thrown through async boundaries and lose their prototype.
+   */
+  private isInteractionError(err: unknown): boolean {
+    if (!err) return false;
+    if (err instanceof pwErrors.TimeoutError) return true;
+    const message = (err as Error).message ?? '';
+    return /timeout|waiting for (?:selector|locator)|not visible|no element|strict mode violation/i.test(
+      message,
+    );
+  }
+
+  // --------------------------------------------------------------------
+  // Metadata capture (browser-side evaluation)
+  // --------------------------------------------------------------------
+
+  private async captureMetadata(
+    logicalName: string,
+    selector: string,
+    locator: Locator,
+  ): Promise<void> {
+    const snapshot: DomSnapshot = await locator.evaluate((el): DomSnapshot => {
+      const node = el as HTMLElement;
+      const parent = node.parentElement;
+
+      // Attributes
+      const attrs: Record<string, string> = {};
+      for (const attr of Array.from(node.attributes)) {
+        attrs[attr.name] = attr.value;
+      }
+
+      // Sibling texts (non-empty only)
+      const siblingTexts: string[] = [];
+      if (parent) {
+        parent.childNodes.forEach((child) => {
+          if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
+          const t = (child as HTMLElement).innerText?.trim();
+          if (t) siblingTexts.push(t);
+        });
+      }
+
+      // Parent's OWN text (exclude descendants).
+      let parentText = '';
+      if (parent) {
+        parent.childNodes.forEach((child) => {
+          if (child.nodeType === Node.TEXT_NODE) {
+            parentText += ` ${child.textContent?.trim() ?? ''}`;
+          }
+        });
+        parentText = parentText.trim();
+      }
+
+      // Associated label (by `for=id` or by wrapping).
+      let labelText = '';
+      if (node.id) {
+        const forLabel = document.querySelector(`label[for="${node.id}"]`);
+        if (forLabel) labelText = (forLabel.textContent ?? '').trim();
+      }
+      if (!labelText) {
+        const wrapping = node.closest('label');
+        if (wrapping) labelText = (wrapping.textContent ?? '').trim();
+      }
+
+      return {
+        tagName: node.tagName.toLowerCase(),
+        id: node.id || undefined,
+        classes: Array.from(node.classList),
+        textContent: (node.innerText ?? node.textContent ?? '').trim(),
+        attributes: attrs,
+        anchor: {
+          parentTag: parent?.tagName.toLowerCase(),
+          parentText,
+          siblingTexts,
+          ariaLabel: node.getAttribute('aria-label') ?? undefined,
+          role: node.getAttribute('role') ?? undefined,
+          dataTestId:
+            node.getAttribute('data-testid') ??
+            node.getAttribute('data-test') ??
+            undefined,
+          labelText: labelText || undefined,
+        },
+      };
+    });
+
+    const pathname = (() => {
+      try {
+        return new URL(this.page.url()).pathname;
+      } catch {
+        return undefined;
+      }
+    })();
+
+    const meta: ElementMetaData = {
+      logicalName,
+      primarySelector: selector,
+      tagName: snapshot.tagName,
+      id: snapshot.id,
+      classes: snapshot.classes,
+      textContent: snapshot.textContent,
+      attributes: snapshot.attributes,
+      anchorContext: snapshot.anchor,
+      capturedAt: new Date().toISOString(),
+      pageUrlPattern: pathname,
+    };
+
+    await this.store.upsert(meta);
+  }
+}

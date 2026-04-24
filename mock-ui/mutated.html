@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Self-Healing Demo - Checkout v2</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      SIMULATED UI DRIFT
+      ------------------
+      Every id, class name, and `data-testid` has been re-generated as
+      would happen after a build-tool migration (e.g. CSS-in-JS hashing,
+      test-id rename, form-framework swap). The DOM *semantics* – visible
+      text, labels, tag structure, order – are unchanged, so the
+      self-healing engine should still find every element.
+    -->
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #f8fafc;
+        color: #0f172a;
+        padding: 40px;
+        margin: 0;
+      }
+      .panel {
+        max-width: 520px;
+        margin: 0 auto;
+        background: #fff;
+        padding: 32px;
+        border-radius: 10px;
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+      }
+      h1 { margin: 0 0 6px; color: #1e293b; font-size: 22px; }
+      .sub { color: #64748b; margin-bottom: 24px; font-size: 14px; }
+      label { display: block; font-weight: 600; margin: 14px 0 6px; color: #334155; font-size: 14px; }
+      input {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        font-size: 14px;
+      }
+      input:focus { outline: 2px solid #2563eb; outline-offset: 1px; }
+      .actions { display: flex; gap: 12px; margin-top: 20px; }
+      button {
+        flex: 1;
+        padding: 11px 16px;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .cta-btn { background: #2563eb; color: white; }
+      .cta-btn:hover { background: #1d4ed8; }
+      .secondary-btn { background: #e2e8f0; color: #475569; }
+      .secondary-btn:hover { background: #cbd5e1; }
+      .status {
+        margin-top: 18px;
+        font-weight: 600;
+        color: #166534;
+        min-height: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <h1>Checkout (v2 - Mutated)</h1>
+      <div class="sub">Heal run – all ids/classes changed, semantics preserved.</div>
+
+      <form id="order-form-v2">
+        <label for="emailAddr_9f3a">Email address</label>
+        <input
+          id="emailAddr_9f3a"
+          name="user_email"
+          class="form-control email-input"
+          type="email"
+          placeholder="you@example.com"
+        />
+
+        <label for="promo_b21c">Coupon code</label>
+        <input
+          id="promo_b21c"
+          name="promo"
+          class="form-control promo-input"
+          type="text"
+          placeholder="SAVE10"
+        />
+
+        <div class="actions">
+          <button id="btn_a1b2c3d4" class="cta-btn primary-cta" type="button">
+            Submit Order
+          </button>
+          <button id="btn_cancel_x" class="secondary-btn" type="button">Cancel</button>
+        </div>
+      </form>
+
+      <p id="notification" class="status"></p>
+    </div>
+
+    <script>
+      document.getElementById('btn_a1b2c3d4').addEventListener('click', () => {
+        const email = document.getElementById('emailAddr_9f3a').value;
+        const msg = document.getElementById('notification');
+        msg.textContent = email
+          ? `Order submitted successfully for ${email}!`
+          : 'Order submitted successfully!';
+      });
+      document.getElementById('btn_cancel_x').addEventListener('click', () => {
+        document.getElementById('notification').textContent = 'Order cancelled.';
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,208 @@
+/**
+ * @file SelfHealingEngine.test.ts
+ * @description Unit tests for the self-healing engine. These tests run
+ *              entirely in-memory against handcrafted HTML fixtures, so
+ *              they execute in < 500 ms and do not require a browser.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { SelfHealingEngine } from './SelfHealingEngine';
+import { ElementMetaData } from '../storage/ElementMetaData';
+
+const metaFromOriginal = (): ElementMetaData => ({
+  logicalName: 'submitButton',
+  primarySelector: '[data-testid="checkout-submit"]',
+  tagName: 'button',
+  id: 'submit-order',
+  classes: ['submit-btn', 'primary-action'],
+  textContent: 'Submit Order',
+  attributes: {
+    id: 'submit-order',
+    class: 'submit-btn primary-action',
+    'data-testid': 'checkout-submit',
+    type: 'button',
+  },
+  anchorContext: {
+    parentTag: 'div',
+    parentText: '',
+    siblingTexts: ['Cancel'],
+    dataTestId: 'checkout-submit',
+    labelText: '',
+  },
+  capturedAt: '2024-01-01T00:00:00.000Z',
+});
+
+const ORIGINAL_DOM = `
+  <html><body><div class="actions">
+    <button id="submit-order" class="submit-btn primary-action" data-testid="checkout-submit" type="button">Submit Order</button>
+    <button id="cancel-order" class="cancel-btn" type="button">Cancel</button>
+  </div></body></html>
+`;
+
+const MUTATED_DOM = `
+  <html><body><div class="actions">
+    <button id="btn_a1b2c3d4" class="cta-btn primary-cta" type="button">Submit Order</button>
+    <button id="btn_cancel_x" class="secondary-btn" type="button">Cancel</button>
+  </div></body></html>
+`;
+
+const UNRELATED_DOM = `
+  <html><body>
+    <h1>404 - Page Not Found</h1>
+    <p>Nothing to see here.</p>
+  </body></html>
+`;
+
+describe('SelfHealingEngine.heal – happy path', () => {
+  it('returns confidence 1 and the same node when the DOM is unchanged', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(ORIGINAL_DOM, metaFromOriginal());
+
+    expect(result.healed).toBe(true);
+    expect(result.confidence).toBeCloseTo(1, 2);
+    expect(result.candidate?.textContent).toBe('Submit Order');
+  });
+
+  it('heals through a full id/class mutation while preserving semantics', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(MUTATED_DOM, metaFromOriginal());
+
+    expect(result.healed).toBe(true);
+    expect(result.confidence).toBeGreaterThanOrEqual(0.6);
+    expect(result.candidate?.textContent).toBe('Submit Order');
+    // The Submit candidate must outrank the Cancel sibling.
+    const ranked = result.topCandidates.map(c => c.textContent);
+    expect(ranked[0]).toBe('Submit Order');
+    expect(ranked.indexOf('Cancel')).toBeGreaterThan(0);
+  });
+
+  it('prefers a stable CSS strategy (id over class) in the healed selector', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(MUTATED_DOM, metaFromOriginal());
+    // The mutated node has id=btn_a1b2c3d4 and no data-testid → selector
+    // should be the id form.
+    expect(result.selector).toBe('#btn_a1b2c3d4');
+  });
+
+  it('emits a well-formed XPath on every candidate', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(MUTATED_DOM, metaFromOriginal());
+    expect(result.candidate?.xpath).toBeDefined();
+    expect(result.candidate!.xpath.startsWith('//')).toBe(true);
+    result.topCandidates.forEach(c =>
+      expect(typeof c.xpath).toBe('string'),
+    );
+  });
+});
+
+describe('SelfHealingEngine.heal – guardrails', () => {
+  it('refuses to heal when no candidate meets the threshold', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(UNRELATED_DOM, metaFromOriginal());
+
+    expect(result.healed).toBe(false);
+    expect(result.selector).toBeUndefined();
+    expect(result.confidence).toBeLessThan(0.6);
+  });
+
+  it('honours an elevated threshold and declines marginal heals', () => {
+    const strict = new SelfHealingEngine({ threshold: 0.95 });
+    const result = strict.heal(MUTATED_DOM, metaFromOriginal());
+    expect(result.healed).toBe(false);
+    // But the engine still reports what it considered, so the StateReporter
+    // has material to explain the failure.
+    expect(result.topCandidates.length).toBeGreaterThan(0);
+  });
+
+  it('falls back to scanning all elements when the captured tag is absent', () => {
+    const engine = new SelfHealingEngine();
+    const domWithoutButtons = `
+      <html><body><div class="actions">
+        <a id="submit-order" class="submit-btn" data-testid="checkout-submit">Submit Order</a>
+      </div></body></html>
+    `;
+    const result = engine.heal(domWithoutButtons, metaFromOriginal());
+    // Tag mismatch should not prevent a heal if other signals are strong.
+    expect(result.candidatesEvaluated).toBeGreaterThan(0);
+    expect(result.candidate?.textContent).toBe('Submit Order');
+  });
+
+  it('keeps confidence within [0, 1]', () => {
+    const engine = new SelfHealingEngine();
+    const result = engine.heal(MUTATED_DOM, metaFromOriginal());
+    result.topCandidates.forEach(c => {
+      expect(c.score).toBeGreaterThanOrEqual(0);
+      expect(c.score).toBeLessThanOrEqual(1);
+    });
+  });
+
+  it('limits topCandidates to the configured topN', () => {
+    const engine = new SelfHealingEngine({ topN: 2 });
+    const result = engine.heal(MUTATED_DOM, metaFromOriginal());
+    expect(result.topCandidates.length).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('SelfHealingEngine.heal – selector strategy precedence', () => {
+  const baseMeta = (): ElementMetaData => ({
+    logicalName: 'el',
+    primarySelector: 'x',
+    tagName: 'button',
+    classes: [],
+    textContent: 'Click me',
+    attributes: {},
+    anchorContext: { siblingTexts: [] },
+    capturedAt: '2024-01-01T00:00:00.000Z',
+  });
+
+  it('prefers data-testid over everything else', () => {
+    const engine = new SelfHealingEngine();
+    const dom = `<button data-testid="go" id="some-id" class="a b">Click me</button>`;
+    const result = engine.heal(dom, baseMeta());
+    expect(result.candidate?.selector).toBe('[data-testid="go"]');
+    expect(result.candidate?.xpath).toBe("//*[@data-testid='go']");
+  });
+
+  it('falls back to id when no data-testid is present', () => {
+    const engine = new SelfHealingEngine();
+    const dom = `<button id="go-btn" class="a b">Click me</button>`;
+    const result = engine.heal(dom, baseMeta());
+    expect(result.candidate?.selector).toBe('#go-btn');
+    expect(result.candidate?.xpath).toBe("//*[@id='go-btn']");
+  });
+
+  it('uses visible text for XPath when only class is available', () => {
+    const engine = new SelfHealingEngine();
+    const dom = `<button class="x y">Click me</button>`;
+    const result = engine.heal(dom, baseMeta());
+    expect(result.candidate?.selector).toBe('button.x.y');
+    expect(result.candidate?.xpath).toBe("//button[normalize-space()='Click me']");
+  });
+
+  it('uses contains(@class) for XPath on non-text tags', () => {
+    const engine = new SelfHealingEngine();
+    const meta = { ...baseMeta(), tagName: 'input', textContent: '' };
+    const dom = `<input class="x y"/>`;
+    const result = engine.heal(dom, meta);
+    expect(result.candidate?.selector).toBe('input.x.y');
+    expect(result.candidate?.xpath).toContain("contains(concat(' ', normalize-space(@class), ' '), ' x ')");
+  });
+});
+
+describe('SelfHealingEngine.heal – custom weights', () => {
+  it('respects injected weights (heavier anchor => higher score for context-heavy match)', () => {
+    const defaultEngine = new SelfHealingEngine();
+    const contextEngine = new SelfHealingEngine({
+      weights: { text: 0.20, tag: 0.10, id: 0.05, classes: 0.10, attributes: 0.10, anchor: 0.45 },
+    });
+
+    // A slight text drift so the two engines score differently.
+    const meta = metaFromOriginal();
+    meta.textContent = 'Place Order';
+
+    const defaultResult = defaultEngine.heal(MUTATED_DOM, meta);
+    const contextResult = contextEngine.heal(MUTATED_DOM, meta);
+
+    expect(contextResult.confidence).toBeGreaterThan(defaultResult.confidence);
+  });
+});
