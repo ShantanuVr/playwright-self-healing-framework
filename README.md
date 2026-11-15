@@ -6,7 +6,7 @@
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.4-3178C6?logo=typescript&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Playwright-1.45-2EAD33?logo=playwright&logoColor=white)
-![Vitest](https://img.shields.io/badge/Vitest-1.6-6E9F18?logo=vitest&logoColor=white)
+![Vitest](https://img.shields.io/badge/Vitest-5.1-6E9F18?logo=vitest&logoColor=white)
 ![Strict TS](https://img.shields.io/badge/strict%20mode-on-success)
 ![Tests](https://img.shields.io/badge/35%20unit%20%2B%203%20e2e-passing-success)
 ![License](https://img.shields.io/badge/license-MIT-blue)
@@ -90,6 +90,8 @@ No LLMs, no API keys, no remote service. Every decision is reproducible and insp
 
 ## Quick start
 
+Requires **Node.js 22.13 or newer**, the first release with built-in `node:sqlite` unflagged.
+
 ```bash
 git clone https://github.com/ShantanuVr/playwright-self-healing-framework.git
 cd playwright-self-healing-framework
@@ -111,6 +113,23 @@ Test Files  2 passed (2)                                           Vitest
 ```
 
 The demo boots a local `http-server` on port `5555`, seeds metadata from `/original.html`, heals on `/mutated.html`, then heals again on `/text-drift.html`.
+
+---
+
+## Storage backends
+
+| Backend | Selected by | Notes |
+| ------- | ----------- | ----- |
+| JSON (default) | any other path, default `storage/element-metadata.json` | Human-readable and diffable in PRs. **Single writer**, so run one Playwright worker. |
+| SQLite | a path ending in `.db` or `.sqlite` | Built on Node's `node:sqlite`, no extra dependency. Safe for **parallel workers**: reads hit the database directly, so workers see each other's heals, and every upsert is a short `BEGIN IMMEDIATE` transaction under WAL with a 5 s busy timeout. |
+
+The demo fixtures read `SELFHEAL_STORE_PATH`:
+
+```bash
+SELFHEAL_STORE_PATH=storage/element-metadata.db npm run test:e2e
+```
+
+In your own fixtures, construct `new SqliteMetadataStore(path)`, call `load()` before use and `close()` at teardown. Node still labels `node:sqlite` experimental and prints a one-time `ExperimentalWarning`. It is still a local file, not a shared remote backend.
 
 ---
 
@@ -179,6 +198,7 @@ src/
 ├── storage/ElementMetaData.ts    Persistence types
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
 ├── storage/JsonMetadataStore.ts  Default JSON-file backend
+├── storage/SqliteMetadataStore.ts SQLite backend (node:sqlite, parallel-safe)
 └── reporting/StateReporter.ts    Console summary + JSON report
 pages/CheckoutPage.ts             Sample Page Object
 mock-ui/{original,mutated,text-drift}.html  Fixture UIs with drifting selectors
@@ -192,8 +212,8 @@ tests/self-healing.spec.ts        Seed -> Heal -> Text-Drift e2e demo
 Everything is built around interfaces, so you can substitute any component without touching the others:
 
 ```ts
-// Swap JSON for SQLite / Redis / DynamoDB
-class SqliteStore implements IMetadataStore { /* ... */ }
+// Add a shared remote backend: Redis / DynamoDB / Postgres
+class RedisStore implements IMetadataStore { /* ... */ }
 
 // Subclass the engine to add embedding-based similarity
 class SemanticEngine extends SelfHealingEngine { /* ... */ }
@@ -213,7 +233,7 @@ new SelfHealingEngine({
 - [x] **Phase 2** — XPath fallback, fresh-on-heal recapture, full Vitest harness, text-drift scenario
 - [ ] **Phase 3**
   - [x] Shadow DOM scanning (open shadow roots)
-  - [ ] SQLite backend
+  - [x] SQLite backend (`node:sqlite`, parallel-worker safe)
   - [ ] Healing-replay CLI
 - [ ] **Phase 4** — Confidence telemetry exporter for Grafana / Datadog
 - [ ] **Phase 5** — Optional embedding-based similarity for semantic drift beyond Levenshtein
@@ -224,8 +244,8 @@ new SelfHealingEngine({
 
 - Closed shadow roots and cross-origin iframes are not scanned. Open shadow roots are: the CSS heal pierces them, but the XPath fallback cannot reach shadow content, because XPath does not pierce shadow roots.
 - Slotted light-DOM content is scored in its light-DOM position, after the host's shadow children, rather than distributed into its `<slot>`.
-- Metadata lives on disk per checkout; a remote backend (SQLite / Redis) is still a Phase 3 item.
-- The JSON store is single-writer. Run one Playwright worker (the default config does); parallel workers would overwrite each other's records.
+- Metadata lives on disk per checkout, as JSON or SQLite. A shared remote backend such as Redis is not provided.
+- The JSON store is single-writer. Run one Playwright worker (the default config does), or use the SQLite backend for parallel workers.
 - The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.
 - Re-capture on heal trusts the first accepted candidate. A post-test verification hook would close the false-positive window.
 - Elements without visible text, such as form inputs, all score a full 1.0 on the text signal against each other. A look-alike field can therefore clear the threshold if the real one disappears; in the demo, the coupon input scores 0.70 against the email fingerprint. Every heal reason records the runner-up score so these near-ties show up. A proper fix re-weights uninformative signals, and that needs a mutation benchmark first.

@@ -3,6 +3,9 @@ dist/
 test-results/
 playwright-report/
 storage/*.json
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
 storage/*.tmp
 storage/*.corrupt-*
 reports/*.json

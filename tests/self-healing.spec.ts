@@ -24,8 +24,10 @@ test.describe.configure({ mode: 'serial' });
 test.describe('Self-Healing E2E Demo', () => {
   test.beforeAll(async () => {
     // Clean slate: ensure the seed run starts with an empty store so the
-    // demo is deterministic on a CI machine.
-    if (fs.existsSync(STORAGE_PATH)) fs.unlinkSync(STORAGE_PATH);
+    // demo is deterministic on a CI machine (incl. SQLite's WAL sidecars).
+    for (const file of [STORAGE_PATH, `${STORAGE_PATH}-wal`, `${STORAGE_PATH}-shm`]) {
+      fs.rmSync(file, { force: true });
+    }
   });
 
   test('1. Seed run: captures metadata from the original UI', async ({

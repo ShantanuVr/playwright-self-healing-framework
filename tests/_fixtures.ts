@@ -10,10 +10,14 @@ import * as path from 'path';
 import { SmartPage } from '../src/core/SmartPage';
 import { SelfHealingEngine } from '../src/healing/SelfHealingEngine';
 import { JsonMetadataStore } from '../src/storage/JsonMetadataStore';
+import { SqliteMetadataStore } from '../src/storage/SqliteMetadataStore';
 import { IMetadataStore } from '../src/storage/IMetadataStore';
 import { StateReporter } from '../src/reporting/StateReporter';
 
-export const STORAGE_PATH = path.resolve('storage/element-metadata.json');
+/** Override with SELFHEAL_STORE_PATH; a `.db` / `.sqlite` path selects SQLite. */
+export const STORAGE_PATH = path.resolve(
+  process.env.SELFHEAL_STORE_PATH ?? 'storage/element-metadata.json',
+);
 export const REPORT_DIR = path.resolve('reports');
 
 interface HealingFixtures {
@@ -25,9 +29,12 @@ interface HealingFixtures {
 
 export const test = base.extend<HealingFixtures>({
   store: async ({}, use) => {
-    const store = new JsonMetadataStore(STORAGE_PATH);
+    const store = /\.(db|sqlite)$/.test(STORAGE_PATH)
+      ? new SqliteMetadataStore(STORAGE_PATH)
+      : new JsonMetadataStore(STORAGE_PATH);
     await store.load();
     await use(store);
+    if (store instanceof SqliteMetadataStore) store.close();
   },
 
   engine: async ({}, use) => {
