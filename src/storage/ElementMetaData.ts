@@ -67,6 +67,18 @@ export interface ElementMetaData {
 }
 
 /**
+ * Everything needed to re-run a heal decision offline (`selfheal replay`).
+ */
+export interface HealReplay {
+  /** The stored fingerprint the engine scored against (pre-heal). */
+  meta: ElementMetaData;
+  /** The DOM the engine scored, exactly as serialised for it. */
+  dom: string;
+  /** The engine's pick in `toLocatorString` form; absent if it found none. */
+  engineSelector?: string;
+}
+
+/**
  * Result of a single interaction attempt, consumed by {@link StateReporter}.
  */
 export interface HealingOutcome {
@@ -80,4 +92,7 @@ export interface HealingOutcome {
   reason?: string;
   durationMs: number;
   timestamp: string;
+  /** Present on every outcome produced after the DOM was read. */
+  // shortcut: DOM is inlined in the report JSON; move to sidecar files if reports grow large.
+  replay?: HealReplay;
 }
