@@ -38,6 +38,10 @@
  * A candidate is treated as a valid heal iff its final score is ≥ the
  * configured `threshold` (default 0.6). Every score is bounded in [0, 1]
  * so the final total is also in [0, 1].
+ *
+ * If no same-tag node clears the threshold, the scan is relaxed to every
+ * element in `<body>` (the element may have been re-tagged, e.g. `button`
+ * → `a`); the tag sub-score penalises the mismatch.
  */
 
 import * as cheerio from 'cheerio';
@@ -69,8 +73,12 @@ export interface AnchorWeights {
 }
 
 export interface HealCandidate {
-  /** Best-effort CSS selector (preferring stable attributes). */
+  /** Best-effort CSS selector – the most stable strategy that is unique in
+   *  the scanned DOM; if none is unique, the most stable one plus `nth`. */
   selector: string;
+  /** Index of this node among `selector`'s matches in document order
+   *  (0 when unique). Combine the two with {@link toLocatorString}. */
+  nth: number;
   /** Equivalent XPath expression – used by SmartPage as a retry fallback
    *  when the CSS form fails (e.g. CSS can't express text-based matches). */
   xpath: string;
@@ -100,6 +108,27 @@ export interface SelfHealingEngineOptions {
   threshold?: number;
   /** Keep top-N candidates in {@link HealResult.topCandidates}. Default 5. */
   topN?: number;
+}
+
+/**
+ * Playwright selector-string form of a candidate: the CSS selector, plus a
+ * `>> nth=N` suffix when the selector also matches other nodes.
+ */
+export function toLocatorString(candidate: Pick<HealCandidate, 'selector' | 'nth'>): string {
+  return candidate.nth > 0 ? `${candidate.selector} >> nth=${candidate.nth}` : candidate.selector;
+}
+
+/** Internal scoring record – keeps the node so selectors are built lazily. */
+interface ScoredNode {
+  node: CheerioNode;
+  attribs: Record<string, string>;
+  depth: number;
+  score: number;
+  tagName: string;
+  id: string;
+  classes: string[];
+  text: string;
+  breakdown: Record<keyof HealingWeights, number>;
 }
 
 const DEFAULT_WEIGHTS: HealingWeights = {
@@ -141,20 +170,20 @@ export class SelfHealingEngine {
   public heal(domHtml: string, meta: ElementMetaData): HealResult {
     const $ = cheerio.load(domHtml);
 
-    // First pass: nodes that share the expected tag. If that returns nothing
-    // (e.g. the element was re-implemented as a different tag) we relax the
-    // constraint to all elements – the tag sub-score will penalise them.
-    let nodes = $(meta.tagName.toLowerCase()).toArray() as CheerioNode[];
-    if (nodes.length === 0) {
-      nodes = $('*').toArray() as CheerioNode[];
+    // First pass: nodes that share the expected tag. If none clears the
+    // threshold (the element may have been re-tagged while other same-tag
+    // nodes remain), relax to every element in the body.
+    let scored = this.scoreAll($, $(meta.tagName.toLowerCase()).toArray() as CheerioNode[], meta);
+    if (scored.length === 0 || scored[0].score < this.threshold) {
+      scored = this.scoreAll($, $('body *').toArray() as CheerioNode[], meta);
     }
 
-    const scored: HealCandidate[] = nodes
-      .filter(n => n.type === 'tag' && n.name !== 'script' && n.name !== 'style')
-      .map(node => this.scoreNode($, node, meta));
-
-    scored.sort((a, b) => b.score - a.score);
-    const best = scored[0];
+    // Selectors are only built for the nodes we report – each one runs
+    // uniqueness queries against the DOM.
+    const top = scored
+      .slice(0, Math.max(this.topN, 1))
+      .map(s => this.toCandidate($, s));
+    const best = top[0];
     const healed = !!best && best.score >= this.threshold;
 
     return {
@@ -163,7 +192,7 @@ export class SelfHealingEngine {
       selector: healed ? best.selector : undefined,
       candidate: healed ? best : undefined,
       candidatesEvaluated: scored.length,
-      topCandidates: scored.slice(0, this.topN),
+      topCandidates: top.slice(0, this.topN),
     };
   }
 
@@ -171,11 +200,24 @@ export class SelfHealingEngine {
   // Scoring
   // --------------------------------------------------------------------
 
+  private scoreAll(
+    $: cheerio.CheerioAPI,
+    nodes: CheerioNode[],
+    meta: ElementMetaData,
+  ): ScoredNode[] {
+    return nodes
+      .filter(n => n.type === 'tag' && n.name !== 'script' && n.name !== 'style')
+      .map(node => this.scoreNode($, node, meta))
+      // Highest score first; on ties the innermost node wins, so a wrapper
+      // whose only content is the target cannot outrank the target itself.
+      .sort((a, b) => b.score - a.score || b.depth - a.depth);
+  }
+
   private scoreNode(
     $: cheerio.CheerioAPI,
     node: CheerioNode,
     meta: ElementMetaData,
-  ): HealCandidate {
+  ): ScoredNode {
     // cheerio's `$(node)` accepts any DOM-handler node; the namespace cast
     // is a one-liner concession to cheerio's fluid typings.
     const $node = $(node as unknown as cheerio.Element);
@@ -221,13 +263,14 @@ export class SelfHealingEngine {
       anchorScore * this.weights.anchor;
 
     return {
-      selector: this.buildSelector(tagName, id, classes, attribs),
-      xpath: this.buildXPath(tagName, id, classes, attribs, text),
+      node,
+      attribs,
+      depth: $node.parents().length,
       score: this.clampScore(total),
       tagName,
-      id: id || undefined,
+      id,
       classes,
-      textContent: text,
+      text,
       breakdown: {
         text: Number(textScore.toFixed(4)),
         tag: Number(tagScore.toFixed(4)),
@@ -236,6 +279,21 @@ export class SelfHealingEngine {
         attributes: Number(attrScore.toFixed(4)),
         anchor: Number(anchorScore.toFixed(4)),
       },
+    };
+  }
+
+  private toCandidate($: cheerio.CheerioAPI, s: ScoredNode): HealCandidate {
+    const { selector, nth } = this.buildSelector($, s.node, s.tagName, s.id, s.classes, s.attribs);
+    return {
+      selector,
+      nth,
+      xpath: this.buildXPath(s.tagName, s.id, s.classes, s.attribs, s.text),
+      score: s.score,
+      tagName: s.tagName,
+      id: s.id || undefined,
+      classes: s.classes,
+      textContent: s.text,
+      breakdown: s.breakdown,
     };
   }
 
@@ -281,11 +339,14 @@ export class SelfHealingEngine {
   ): number {
     const ctx = meta.anchorContext ?? { siblingTexts: [] };
 
-    // Parent's OWN text (excluding descendant text).
+    // Parent's OWN text (its direct text nodes, excluding descendants).
     const $parent = $node.parent();
-    const parentText = $parent.length
-      ? $parent.clone().children().remove().end().text().replace(/\s+/g, ' ').trim()
-      : '';
+    const parentText = $parent
+      .contents()
+      .filter((_, n) => (n as CheerioNode).type === 'text')
+      .text()
+      .replace(/\s+/g, ' ')
+      .trim();
     const parentTextScore = SimilarityUtils.stringSimilarity(
       parentText,
       ctx.parentText ?? '',
@@ -335,7 +396,7 @@ export class SelfHealingEngine {
     id: string,
   ): string {
     if (id) {
-      const byFor = $(`label[for="${id}"]`).first();
+      const byFor = $(`label[for="${this.escapeValue(id)}"]`).first();
       if (byFor.length) return byFor.text().replace(/\s+/g, ' ').trim();
     }
     const wrapping = $node.parents('label').first();
@@ -348,27 +409,45 @@ export class SelfHealingEngine {
   // --------------------------------------------------------------------
 
   /**
-   * Produce the most STABLE CSS selector we can extract from the matched
-   * node, preferring purpose-built attributes (`data-testid`, `data-test`)
-   * over incidental ones (id, class). This minimises the odds of a fresh
-   * break on the next UI iteration.
+   * Produce the most STABLE CSS selector that points at exactly this node,
+   * preferring purpose-built attributes (`data-testid`, `data-test`) over
+   * incidental ones (id, class). Strategies are tried in that order and the
+   * first one that is unique in the DOM wins; if none is unique, the first
+   * one that matches is kept together with the node's index among its
+   * matches, so callers never silently act on a look-alike.
    */
   private buildSelector(
+    $: cheerio.CheerioAPI,
+    node: CheerioNode,
     tag: string,
     id: string,
     classes: string[],
     attrs: Record<string, string>,
-  ): string {
-    if (attrs['data-testid']) return `[data-testid="${this.escapeValue(attrs['data-testid'])}"]`;
-    if (attrs['data-test'])   return `[data-test="${this.escapeValue(attrs['data-test'])}"]`;
-    if (id)                   return `#${this.cssIdent(id)}`;
-    if (attrs['aria-label'])  return `${tag}[aria-label="${this.escapeValue(attrs['aria-label'])}"]`;
-    if (attrs['name'])        return `${tag}[name="${this.escapeValue(attrs['name'])}"]`;
-    if (classes.length) {
-      const cls = classes.slice(0, 2).map(c => `.${this.cssIdent(c)}`).join('');
-      return `${tag}${cls}`;
+  ): { selector: string; nth: number } {
+    const strategies = [
+      attrs['data-testid'] && `[data-testid="${this.escapeValue(attrs['data-testid'])}"]`,
+      attrs['data-test'] && `[data-test="${this.escapeValue(attrs['data-test'])}"]`,
+      id && `#${this.cssIdent(id)}`,
+      attrs['aria-label'] && `${tag}[aria-label="${this.escapeValue(attrs['aria-label'])}"]`,
+      attrs['name'] && `${tag}[name="${this.escapeValue(attrs['name'])}"]`,
+      classes.length > 0 && `${tag}${classes.slice(0, 2).map(c => `.${this.cssIdent(c)}`).join('')}`,
+      tag,
+    ].filter((s): s is string => !!s);
+
+    let fallback: { selector: string; nth: number } | undefined;
+    for (const selector of strategies) {
+      let matches: unknown[];
+      try {
+        matches = $(selector).toArray();
+      } catch {
+        continue; // css-select cannot parse this form – try the next one
+      }
+      const nth = matches.indexOf(node);
+      if (nth === -1) continue;
+      if (matches.length === 1) return { selector, nth: 0 };
+      fallback ??= { selector, nth };
     }
-    return tag;
+    return fallback ?? { selector: tag, nth: 0 };
   }
 
   /**
@@ -410,8 +489,11 @@ export class SelfHealingEngine {
   }
 
   private cssIdent(value: string): string {
-    // Escape characters that are illegal in CSS identifiers.
-    return value.replace(/([^a-zA-Z0-9_-])/g, '\\$1');
+    // Escape characters that are illegal in CSS identifiers, and a leading
+    // digit (optionally after "-") as a hex escape, like CSS.escape does.
+    return value
+      .replace(/([^a-zA-Z0-9_-])/g, '\\$1')
+      .replace(/^(-?)(\d)/, (_m, dash: string, digit: string) => `${dash}\\3${digit} `);
   }
 
   private escapeValue(value: string): string {

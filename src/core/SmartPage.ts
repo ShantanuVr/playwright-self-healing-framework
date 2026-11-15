@@ -36,7 +36,7 @@ import {
   HealingOutcome,
   AnchorContext,
 } from '../storage/ElementMetaData';
-import { SelfHealingEngine, HealResult } from '../healing/SelfHealingEngine';
+import { SelfHealingEngine, HealResult, toLocatorString } from '../healing/SelfHealingEngine';
 import { StateReporter } from '../reporting/StateReporter';
 
 export interface SmartPageOptions {
@@ -256,7 +256,8 @@ export class SmartPage {
       return fail(`Healing engine error: ${(engineErr as Error).message}`);
     }
 
-    if (!result.healed || !result.selector) {
+    const candidate = result.candidate;
+    if (!result.healed || !candidate) {
       return fail(
         `No DOM candidate met the confidence threshold. ` +
           `Best score=${result.confidence.toFixed(3)} ` +
@@ -265,15 +266,17 @@ export class SmartPage {
       );
     }
 
-    // Try the primary (CSS) healed selector first; if that throws at click
-    // time (e.g. the CSS form became ambiguous), fall back to the XPath
-    // expression that the engine produced for the same candidate.
+    // Try the CSS healed selector first (with `>> nth=N` when the CSS form
+    // also matches look-alikes); if that throws at action time, fall back
+    // to the XPath expression the engine produced for the same candidate.
+    const cssLocator = toLocatorString(candidate);
     const attempts: Array<{ locatorExpr: string; kind: 'css' | 'xpath' }> = [
-      { locatorExpr: result.selector, kind: 'css' },
+      { locatorExpr: cssLocator, kind: 'css' },
+      { locatorExpr: `xpath=${candidate.xpath}`, kind: 'xpath' },
     ];
-    if (result.candidate?.xpath) {
-      attempts.push({ locatorExpr: `xpath=${result.candidate.xpath}`, kind: 'xpath' });
-    }
+    // Surfaced in the reason so near-ties are visible in the audit trail.
+    const runnerUp = result.topCandidates[1]?.score;
+    const runnerUpNote = runnerUp === undefined ? '' : ` (runner-up ${runnerUp.toFixed(3)})`;
 
     let lastError: Error | undefined;
     for (const attempt of attempts) {
@@ -309,8 +312,8 @@ export class SmartPage {
         confidence: result.confidence,
         strategy: 'healed',
         reason:
-          `Matched "${result.candidate?.textContent ?? ''}" ` +
-          `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}.`,
+          `Matched "${candidate.textContent}" ` +
+          `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}${runnerUpNote}.`,
         durationMs: 0,
         timestamp,
       };
@@ -319,7 +322,7 @@ export class SmartPage {
     return fail(
       `Healed selector(s) failed on retry: ${lastError?.message ?? 'unknown'}`,
       result.confidence,
-      result.selector,
+      cssLocator,
     );
   }
 
