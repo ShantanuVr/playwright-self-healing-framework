@@ -9,7 +9,7 @@
 ![Playwright](https://img.shields.io/badge/Playwright-1.59-2EAD33?logo=playwright&logoColor=white)
 ![Vitest](https://img.shields.io/badge/Vitest-5.1-6E9F18?logo=vitest&logoColor=white)
 ![Strict TS](https://img.shields.io/badge/strict%20mode-on-success)
-![Tests](https://img.shields.io/badge/122%20unit%20%2B%208%20e2e-passing-success)
+![Tests](https://img.shields.io/badge/122%20unit%20%2B%2010%20e2e-passing-success)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ---
@@ -84,7 +84,7 @@ When a later run's primary selector times out, the engine takes over:
    | Id              | 0.05   | Deliberately low — ids churn first                                     |
 
 3. Accepts the top candidate iff its blended score clears the threshold (default `0.6`). If no node with the original tag clears it, the scan widens to every element in `<body>`, since the element may have been re-tagged (`button` → `a`). Ties go to the innermost node, and the runner-up score is recorded in the heal reason.
-4. Emits **both** a CSS selector and an XPath, the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express. The CSS form is the most stable strategy that is **unique** on the page. If none is unique, it gets a `>> nth=N` suffix so a look-alike element is never used by mistake. Such an index follows DOM order, so later runs re-check it against the fingerprint and re-heal if rows moved. The XPath fallback is only used when it matches exactly one element.
+4. Emits **both** a CSS selector and an XPath, the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express. The CSS form is the most stable strategy that is **unique** on the page. If none is unique, it gets a `>> nth=N` suffix, even for the first match (`nth=0`), so the right element is targeted. Such an index follows DOM order, so later runs re-check it against the fingerprint and re-heal if rows moved. Stored selectors also resolve strictly: one that has become ambiguous since it was recorded triggers a heal instead of silently hitting the first match. The XPath fallback is only used when it matches exactly one element.
 5. **Re-captures** the fingerprint from the healed node, so the next mutation scores against up-to-date data instead of the original snapshot. In `readonly` capture mode nothing is written. The heal still happens, but the store is left untouched.
 
 By default: no LLMs, no API keys, no remote service. Every decision is reproducible and inspectable. Embedding similarity is strictly opt-in (see below).
@@ -112,12 +112,14 @@ Test Files  6 passed (6)                                           Vitest
  ✓ Regressions › readonly capture mode heals without writing the store     ( 1.2s)
  ✓ Regressions › an ambiguous XPath fallback is never used                 ( 2.1s)
  ✓ Regressions › a positional selector that drifted ... is re-healed       ( 1.1s)
+ ✓ Regressions › the FIRST of several look-alikes is also stored by index  ( 1.1s)
+ ✓ Regressions › a stored selector that turned ambiguous later is healed   ( 0.1s)
  ✓ 1. Seed run: captures metadata from the original UI                      ( 0.1s)
  ✓ 2. Heal run: recovers from full id/class mutation                        (12.2s)
  ✓ 3. Text-drift run: recovers when copy ALSO changes                       (12.2s)
  ✓ 4. Shadow DOM run: heals into an open shadow root                        (12.2s)
 
- 8 passed (41.7s)                                                            Playwright
+10 passed (43s)                                                             Playwright
 ```
 
 The demo boots a tiny built-in static server (`scripts/serve-static.js`) on port `5555`, seeds metadata from `/original.html`, heals on `/mutated.html`, heals again on `/text-drift.html`, then follows the form into a web component's shadow root on `/shadow-dom.html`. Each heal takes about 12 s, almost all of it the 4 s action timeout expiring once per broken selector before healing starts.
@@ -239,7 +241,8 @@ The demo fixtures switch it on via env: `SELFHEAL_EMBEDDINGS_URL`, `SELFHEAL_EMB
   - If the provider errors or returns malformed vectors, the heal continues on lexical scores.
   - The warning is recorded in the heal reason.
 - **Bounded cost.**
-  - One `embed()` call per heal, covering the stored text plus the unique texts of the top 50 lexical candidates (each clipped to 2,000 characters).
+  - At most two `embed()` calls per heal: one for the same-tag pass, and one more only if the scan has to widen. Each covers the stored text plus the unique texts of the top 50 lexical candidates (each clipped to 2,000 characters).
+  - Elements stored by index (`>> nth=N`) are re-checked on every interaction, so with embeddings on, each such interaction makes a provider call too.
   - Elements without visible text, such as inputs, never trigger a call.
 - **Baseline matters.** Real models give *unrelated* short texts a cosine of roughly 0.3–0.6. Blending raw cosine would lift every wrong candidate toward the threshold, so similarity is rescaled above `baseline` (default `0.5`). Lower it for models with low baseline similarity, such as OpenAI `text-embedding-3` or MiniLM, and keep or raise it for high ones such as nomic or BGE.
 - **Embeddings run before the scan widens.** A reworded element is blended within the same-tag pass, and the scan widens only if that still fails.
@@ -287,7 +290,7 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 - **SOLID decomposition.** `IMetadataStore` abstracts storage. `SelfHealingEngine` and `StateReporter` are injected collaborators, so each can be subclassed or swapped.
 - **POM-friendly.** Drop into any Page Object suite — supply logical names and optional hints, nothing else.
 - **Full audit trail.** Every interaction logged to console + persisted as JSON with per-signal breakdown, confidence, before/after selector.
-- **122 unit tests and 8 browser scenarios.** CI runs them on Node 22 and 24, against both storage backends. Engine correctness is not trust-me-bro.
+- **122 unit tests and 10 browser scenarios.** CI runs them on Node 22 and 24, against both storage backends. Engine correctness is not trust-me-bro.
 
 ---
 
@@ -372,7 +375,7 @@ new SelfHealingEngine({
 - Closed shadow roots and cross-origin iframes are not scanned. Open shadow roots are: the CSS heal pierces them, but the XPath fallback cannot reach shadow content, because XPath does not pierce shadow roots.
 - Slotted light-DOM content is scored in its light-DOM position, after the host's shadow children, rather than distributed into its `<slot>`.
 - The flattened DOM is re-parsed with HTML repair rules. Shadow content the parser would restructure, such as block elements inside a `<p>` host or custom elements in table context, scores with shifted parent and sibling context.
-- Elements that never get a unique selector are stored by index (`>> nth=N`). Each run re-checks that index against the fingerprint, which costs one extra DOM read for those elements only.
+- Elements that never get a unique selector are stored by index (`>> nth=N`). Each run re-checks that index against the fingerprint, which costs one extra DOM read (and an embedding call when embeddings are on) for those elements only. Two truly identical twins, with the same text and the same neighbours, cannot be told apart.
 - Metadata lives on disk per checkout, as JSON or SQLite. A shared remote backend such as Redis is not provided.
 - The JSON store is single-writer. Run one Playwright worker (the default config does), or use the SQLite backend for parallel workers.
 - The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.

@@ -115,4 +115,40 @@ test.describe('Regressions', () => {
     expect(await page.evaluate(() => (window as Win).__clicked)).toBe('Bravo');
     expect(reporter.entries[1]).toMatchObject({ strategy: 'healed', healedSelector: 'button.del >> nth=2' });
   });
+
+  test('the FIRST of several look-alikes is also stored by index and re-healed', async ({ page }, testInfo) => {
+    const row = (name: string) => `<li><span>${name}</span><button class="del">Delete</button></li>`;
+    await page.setContent(`
+      <ul>${row('Alpha')}${row('Bravo')}</ul>
+      <script>document.addEventListener('click', e => { window.__clicked = e.target.previousElementSibling.textContent; }, true);</script>`);
+    const { smart, store } = await isolatedSmartPage(page, testInfo.outputPath('meta.json'), [
+      fingerprint({ logicalName: 'row.delete', classes: ['del'], textContent: 'Delete', attributes: { class: 'del' }, anchorContext: { siblingTexts: ['Alpha'] } }),
+    ]);
+
+    await smart.click('row.delete');
+    // Index 0, but still ambiguous: it must be marked, or the drift check never runs.
+    expect(store.get('row.delete')?.primarySelector).toBe('button.del >> nth=0');
+
+    await page.evaluate(() => document.querySelector('ul')!.insertAdjacentHTML('afterbegin', '<li><span>New</span><button class="del">Delete</button></li>'));
+    await smart.click('row.delete');
+    expect(await page.evaluate(() => (window as Win).__clicked)).toBe('Alpha');
+  });
+
+  test('a stored selector that turned ambiguous later is healed, not first-matched', async ({ page }, testInfo) => {
+    await page.setContent(`
+      <div id="promo"></div>
+      <div><span>Checkout total</span><button class="cta">Pay</button></div>
+      <script>document.addEventListener('click', e => { window.__clicked = e.target.previousElementSibling.textContent; }, true);</script>`);
+    const { smart, reporter } = await isolatedSmartPage(page, testInfo.outputPath('meta.json'), [
+      fingerprint({ logicalName: 'pay', primarySelector: 'button.cta', classes: ['cta'], textContent: 'Pay', attributes: { class: 'cta' }, anchorContext: { siblingTexts: ['Checkout total'] } }),
+    ]);
+
+    // A promo banner adds a look-alike ABOVE the real button: `button.cta` now
+    // matches twice, and `.first()` would hit the banner.
+    await page.evaluate(() => { document.getElementById('promo')!.innerHTML = '<span>Promo deal</span><button class="cta">Pay</button>'; });
+    await smart.click('pay');
+
+    expect(await page.evaluate(() => (window as Win).__clicked)).toBe('Checkout total');
+    expect(reporter.entries[0]).toMatchObject({ strategy: 'healed', healedSelector: 'button.cta >> nth=1' });
+  });
 });

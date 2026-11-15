@@ -180,7 +180,12 @@ export class SmartPage {
       );
     }
 
-    const locator = this.page.locator(primary).first();
+    // Stored selectors resolve strictly: if one has turned ambiguous since it
+    // was recorded, Playwright's strict-mode error triggers a heal instead of
+    // the first match being used silently. Hints with no history keep `.first()`.
+    const locator = this.store.get(logicalName)
+      ? this.page.locator(primary)
+      : this.page.locator(primary).first();
     let snap: DomSnapshot | undefined;
     try {
       snap = await this.captureBefore(locator);
@@ -400,13 +405,14 @@ export class SmartPage {
    */
   private async playwrightLocator(candidate: HealCandidate): Promise<string> {
     let index = candidate.nth;
+    let matches = candidate.nth > 0 ? 2 : 1;
     try {
-      index = await this.page.locator(candidate.selector).evaluateAll((els, nth) => {
-        const matches = new Set<Element>(els);
+      [index, matches] = await this.page.locator(candidate.selector).evaluateAll((els, nth) => {
+        const all = new Set<Element>(els);
         const flatOrder: Element[] = [];
         const walk = (n: Node): void => {
           if (n instanceof Element) {
-            if (matches.has(n)) flatOrder.push(n);
+            if (all.has(n)) flatOrder.push(n);
             n.shadowRoot?.childNodes.forEach(walk);
           }
           n.childNodes.forEach(walk);
@@ -414,13 +420,15 @@ export class SmartPage {
         walk(document.documentElement);
         const target = flatOrder[nth];
         const i = target ? (els as Element[]).indexOf(target) : -1;
-        return i >= 0 ? i : nth;
+        return [i >= 0 ? i : nth, els.length] as [number, number];
       }, candidate.nth);
     } catch {
-      // Playwright rejected the selector: keep the engine's index. The
+      // Playwright rejected the selector: keep the engine's view. The
       // action then fails on its own and falls through to the XPath attempt.
     }
-    return toLocatorString({ selector: candidate.selector, nth: index });
+    // Any ambiguous selector carries its index – even 0 – so later runs
+    // re-check it (see positionalDrifted) instead of trusting the first match.
+    return matches > 1 ? `${candidate.selector} >> nth=${index}` : candidate.selector;
   }
 
   /**
