@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is now 26.04, which the locked Playwright (1.59)
+    # cannot install browsers on. Unpin together with a Playwright upgrade.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
