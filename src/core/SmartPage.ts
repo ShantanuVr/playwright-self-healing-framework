@@ -36,7 +36,12 @@ import {
   HealingOutcome,
   AnchorContext,
 } from '../storage/ElementMetaData';
-import { SelfHealingEngine, HealResult, toLocatorString } from '../healing/SelfHealingEngine';
+import {
+  SelfHealingEngine,
+  HealCandidate,
+  HealResult,
+  toLocatorString,
+} from '../healing/SelfHealingEngine';
 import { StateReporter } from '../reporting/StateReporter';
 
 export interface SmartPageOptions {
@@ -244,9 +249,9 @@ export class SmartPage {
 
     let domHtml: string;
     try {
-      domHtml = await this.page.content();
+      domHtml = await this.readDom();
     } catch (contentErr) {
-      return fail(`Unable to read page.content(): ${(contentErr as Error).message}`);
+      return fail(`Unable to read DOM: ${(contentErr as Error).message}`);
     }
 
     let result: HealResult;
@@ -269,7 +274,7 @@ export class SmartPage {
     // Try the CSS healed selector first (with `>> nth=N` when the CSS form
     // also matches look-alikes); if that throws at action time, fall back
     // to the XPath expression the engine produced for the same candidate.
-    const cssLocator = toLocatorString(candidate);
+    const cssLocator = await this.playwrightLocator(candidate);
     const attempts: Array<{ locatorExpr: string; kind: 'css' | 'xpath' }> = [
       { locatorExpr: cssLocator, kind: 'css' },
       { locatorExpr: `xpath=${candidate.xpath}`, kind: 'xpath' },
@@ -327,6 +332,39 @@ export class SmartPage {
   }
 
   /**
+   * Translate the engine's `nth` – document order of the flattened DOM, in
+   * which shadow children precede their host's light children – into
+   * Playwright's own match order, which lists a tree's light nodes before
+   * its shadow roots' nodes. Every selector strategy is a single compound
+   * selector, so both sides match the same set; only the order differs, and
+   * mapping the target element between the two orders is exact.
+   */
+  private async playwrightLocator(candidate: HealCandidate): Promise<string> {
+    let index = candidate.nth;
+    try {
+      index = await this.page.locator(candidate.selector).evaluateAll((els, nth) => {
+        const matches = new Set<Element>(els);
+        const flatOrder: Element[] = [];
+        const walk = (n: Node): void => {
+          if (n instanceof Element) {
+            if (matches.has(n)) flatOrder.push(n);
+            n.shadowRoot?.childNodes.forEach(walk);
+          }
+          n.childNodes.forEach(walk);
+        };
+        walk(document.documentElement);
+        const target = flatOrder[nth];
+        const i = target ? (els as Element[]).indexOf(target) : -1;
+        return i >= 0 ? i : nth;
+      }, candidate.nth);
+    } catch {
+      // Playwright rejected the selector: keep the engine's index. The
+      // action then fails on its own and falls through to the XPath attempt.
+    }
+    return toLocatorString({ selector: candidate.selector, nth: index });
+  }
+
+  /**
    * Detect errors that indicate the locator is broken, as opposed to true
    * application errors we must not swallow. We prefer `instanceof
    * TimeoutError` but fall back to a message heuristic because some error
@@ -342,8 +380,32 @@ export class SmartPage {
   }
 
   // --------------------------------------------------------------------
-  // Metadata capture (browser-side evaluation)
+  // Browser-side evaluation: DOM serialisation & metadata capture
   // --------------------------------------------------------------------
+
+  /**
+   * Serialise the live DOM for the engine, inlining every OPEN shadow root
+   * into its host (before the host's light children) so shadow content can
+   * be scored. Nodes are copied into an inert document: copying inside the
+   * live one would upgrade custom elements (re-running their constructors)
+   * and could start loading cloned media.
+   */
+  private async readDom(): Promise<string> {
+    return this.page.evaluate(() => {
+      const doc = document.implementation.createHTMLDocument('');
+      // shortcut: <slot> content is not distributed (shadow children precede
+      // light children); use assignedNodes() if slotted elements score poorly.
+      const flat = (n: Node): Node => {
+        const copy = doc.importNode(n, false);
+        if (n instanceof Element && n.shadowRoot) {
+          n.shadowRoot.childNodes.forEach(k => copy.appendChild(flat(k)));
+        }
+        n.childNodes.forEach(k => copy.appendChild(flat(k)));
+        return copy;
+      };
+      return (flat(document.documentElement) as Element).outerHTML;
+    });
+  }
 
   /**
    * Harvest the element's fingerprint in the browser. Waits up to the
@@ -354,7 +416,14 @@ export class SmartPage {
     return locator.evaluate(
       (el): DomSnapshot => {
         const node = el as HTMLElement;
-        const parent = node.parentElement;
+        // Mirror the engine's flattened view (see readDom): a top-level node
+        // of a shadow root belongs to the host, and a host's children are its
+        // open shadow root's children followed by its light children.
+        const parent: Element | null =
+          node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentElement;
+        const kids: ChildNode[] = parent
+          ? [...Array.from(parent.shadowRoot?.childNodes ?? []), ...Array.from(parent.childNodes)]
+          : [];
 
         // Attributes
         const attrs: Record<string, string> = {};
@@ -364,29 +433,26 @@ export class SmartPage {
 
         // Sibling texts (non-empty only)
         const siblingTexts: string[] = [];
-        if (parent) {
-          parent.childNodes.forEach((child) => {
-            if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
-            const t = (child as HTMLElement).innerText?.trim();
-            if (t) siblingTexts.push(t);
-          });
-        }
+        kids.forEach((child) => {
+          if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
+          const t = (child as HTMLElement).innerText?.trim();
+          if (t) siblingTexts.push(t);
+        });
 
         // Parent's OWN text (exclude descendants).
         let parentText = '';
-        if (parent) {
-          parent.childNodes.forEach((child) => {
-            if (child.nodeType === Node.TEXT_NODE) {
-              parentText += ` ${child.textContent?.trim() ?? ''}`;
-            }
-          });
-          parentText = parentText.trim();
-        }
+        kids.forEach((child) => {
+          if (child.nodeType === Node.TEXT_NODE) {
+            parentText += ` ${child.textContent?.trim() ?? ''}`;
+          }
+        });
+        parentText = parentText.trim();
 
-        // Associated label (by `for=id` or by wrapping).
+        // Associated label (by `for=id` within the same tree, or by wrapping).
         let labelText = '';
         if (node.id) {
-          const forLabel = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+          const root = node.getRootNode() as Document | ShadowRoot;
+          const forLabel = root.querySelector(`label[for="${CSS.escape(node.id)}"]`);
           if (forLabel) labelText = (forLabel.textContent ?? '').trim();
         }
         if (!labelText) {
