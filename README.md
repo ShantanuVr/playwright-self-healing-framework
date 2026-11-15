@@ -262,13 +262,13 @@ The demo fixtures switch it on via env: `SELFHEAL_EMBEDDINGS_URL`, `SELFHEAL_EMB
                                  |  ^                            |
                             fails|  |healed                       |DOM
                                  v  |                            v
-                          +-----------------+           +-----------------+
-                          |SelfHealingEngine|<----------| page.content()  |
-                          +-----------------+           +-----------------+
-                                 |  ^
+                          +-----------------+           +------------------+
+                          |SelfHealingEngine|<----------| flattened DOM    |
+                          +-----------------+           | (+ shadow roots) |
+                                 |  ^                   +------------------+
                                  v  |
                           +-----------------+
-                          | IMetadataStore  |  (JSON today, SQLite tomorrow)
+                          | IMetadataStore  |  (JSON or SQLite)
                           +-----------------+
                                  |
                                  v
@@ -336,7 +336,7 @@ scripts/serve-static.js           Built-in static server for the mock UI (e2e)
 
 ## Extending
 
-Everything is built around interfaces, so you can substitute any component without touching the others:
+Storage and embeddings sit behind interfaces, and the engine is configurable and subclassable, so you can swap any of them without touching the orchestration code:
 
 ```ts
 // Add a shared remote backend: Redis / DynamoDB / Postgres
