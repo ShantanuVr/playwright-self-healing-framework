@@ -75,6 +75,25 @@ export class SimilarityUtils {
   }
 
   /**
+   * Cosine similarity of two vectors, clamped to [0, 1] – for our purposes
+   * a negative cosine is simply "unrelated". Returns 0 for empty, all-zero
+   * or mismatched-length vectors.
+   */
+  public static cosine(a: number[], b: number[]): number {
+    if (a.length === 0 || a.length !== b.length) return 0;
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return Math.min(1, Math.max(0, dot / Math.sqrt(normA * normB)));
+  }
+
+  /**
    * Lightweight tokeniser: splits on whitespace and common CSS/HTML
    * separators (`- _ / .`). Drops empty fragments. Intentionally avoids a
    * heavyweight NLP dependency – this is enough to compare class lists,

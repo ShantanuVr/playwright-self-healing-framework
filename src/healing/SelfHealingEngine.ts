@@ -42,11 +42,17 @@
  * If no same-tag node clears the threshold, the scan is relaxed to every
  * element in `<body>` (the element may have been re-tagged, e.g. `button`
  * → `a`); the tag sub-score penalises the mismatch.
+ *
+ * Optional (Phase 5): with an {@link IEmbeddingProvider} configured, the
+ * text signal becomes a blend of Levenshtein and embedding cosine
+ * similarity, so copy rewrites with the same meaning still score well.
+ * Without one the engine never touches the network.
  */
 
 import * as cheerio from 'cheerio';
 import { ElementMetaData } from '../storage/ElementMetaData';
 import { SimilarityUtils } from './SimilarityUtils';
+import { IEmbeddingProvider } from './IEmbeddingProvider';
 
 /** Local minimal shape of a cheerio element we rely on. */
 type CheerioNode = {
@@ -99,6 +105,16 @@ export interface HealResult {
   candidatesEvaluated: number;
   /** Top-N candidates, included in reports for auditability. */
   topCandidates: HealCandidate[];
+  /** True when embedding similarity was blended into the text signal. */
+  embeddingsUsed?: boolean;
+  /** Set when the embedding provider failed and lexical scores were kept. */
+  warning?: string;
+}
+
+export interface EmbeddingOptions {
+  provider: IEmbeddingProvider;
+  /** Share of the text signal taken from embedding cosine similarity, in [0, 1]. Default 0.5. */
+  weight?: number;
 }
 
 export interface SelfHealingEngineOptions {
@@ -108,6 +124,8 @@ export interface SelfHealingEngineOptions {
   threshold?: number;
   /** Keep top-N candidates in {@link HealResult.topCandidates}. Default 5. */
   topN?: number;
+  /** Opt-in semantic text similarity (Phase 5). Off by default. */
+  embeddings?: EmbeddingOptions;
 }
 
 /**
@@ -128,8 +146,18 @@ interface ScoredNode {
   id: string;
   classes: string[];
   text: string;
-  breakdown: Record<keyof HealingWeights, number>;
+  /** Unrounded sub-scores; rounded only when reported. */
+  parts: Record<keyof HealingWeights, number>;
 }
+
+/** Highest score first; on ties the innermost node wins, so a wrapper whose
+ *  only content is the target cannot outrank the target itself. */
+const byScore = (a: ScoredNode, b: ScoredNode): number => b.score - a.score || b.depth - a.depth;
+
+// shortcut: only the top 50 lexical candidates are embedded; raise if semantic matches rank lower.
+const EMBED_POOL = 50;
+// Container texts can be huge; clip so no input blows an endpoint's per-input token limit.
+const EMBED_MAX_CHARS = 2_000;
 
 const DEFAULT_WEIGHTS: HealingWeights = {
   text: 0.45,
@@ -153,12 +181,20 @@ export class SelfHealingEngine {
   private readonly anchorWeights: AnchorWeights;
   private readonly threshold: number;
   private readonly topN: number;
+  private readonly embeddings?: Required<EmbeddingOptions>;
 
   constructor(options: SelfHealingEngineOptions = {}) {
     this.weights = { ...DEFAULT_WEIGHTS, ...(options.weights ?? {}) };
     this.anchorWeights = { ...DEFAULT_ANCHOR_WEIGHTS, ...(options.anchorWeights ?? {}) };
     this.threshold = options.threshold ?? 0.6;
     this.topN = options.topN ?? 5;
+    if (options.embeddings) {
+      const weight = options.embeddings.weight ?? 0.5;
+      if (!(weight >= 0 && weight <= 1)) {
+        throw new Error(`[SelfHealingEngine] embeddings.weight must be in [0, 1], got ${weight}`);
+      }
+      this.embeddings = { provider: options.embeddings.provider, weight };
+    }
   }
 
   /**
@@ -167,7 +203,7 @@ export class SelfHealingEngine {
    * @param domHtml The full HTML of the page (e.g. `await page.content()`).
    * @param meta    The historical metadata of the target element.
    */
-  public heal(domHtml: string, meta: ElementMetaData): HealResult {
+  public async heal(domHtml: string, meta: ElementMetaData): Promise<HealResult> {
     const $ = cheerio.load(domHtml);
 
     // First pass: nodes that share the expected tag. If none clears the
@@ -176,6 +212,17 @@ export class SelfHealingEngine {
     let scored = this.scoreAll($, $(meta.tagName.toLowerCase()).toArray() as CheerioNode[], meta);
     if (scored.length === 0 || scored[0].score < this.threshold) {
       scored = this.scoreAll($, $('body *').toArray() as CheerioNode[], meta);
+    }
+
+    let embeddingsUsed = false;
+    let warning: string | undefined;
+    if (this.embeddings && meta.textContent.trim()) {
+      try {
+        embeddingsUsed = await this.blendEmbeddings(scored, meta.textContent.trim(), this.embeddings);
+      } catch (err) {
+        // Never fail a heal because the provider is down: keep lexical scores.
+        warning = `Embedding provider failed, kept lexical text scores: ${(err as Error).message}`;
+      }
     }
 
     // Selectors are only built for the nodes we report – each one runs
@@ -193,6 +240,8 @@ export class SelfHealingEngine {
       candidate: healed ? best : undefined,
       candidatesEvaluated: scored.length,
       topCandidates: top.slice(0, this.topN),
+      embeddingsUsed,
+      warning,
     };
   }
 
@@ -208,9 +257,53 @@ export class SelfHealingEngine {
     return nodes
       .filter(n => n.type === 'tag' && n.name !== 'script' && n.name !== 'style')
       .map(node => this.scoreNode($, node, meta))
-      // Highest score first; on ties the innermost node wins, so a wrapper
-      // whose only content is the target cannot outrank the target itself.
-      .sort((a, b) => b.score - a.score || b.depth - a.depth);
+      .sort(byScore);
+  }
+
+  private blend(parts: Record<keyof HealingWeights, number>): number {
+    return (
+      parts.text       * this.weights.text +
+      parts.tag        * this.weights.tag +
+      parts.id         * this.weights.id +
+      parts.classes    * this.weights.classes +
+      parts.attributes * this.weights.attributes +
+      parts.anchor     * this.weights.anchor
+    );
+  }
+
+  /**
+   * Blend embedding cosine similarity into the text signal of the top
+   * lexical candidates (`text = (1-w)·levenshtein + w·cosine`), re-score and
+   * re-sort `scored` in place. Returns false when nothing could be embedded.
+   */
+  private async blendEmbeddings(
+    scored: ScoredNode[],
+    metaText: string,
+    { provider, weight }: Required<EmbeddingOptions>,
+  ): Promise<boolean> {
+    const pool = scored.slice(0, EMBED_POOL).filter(s => s.text);
+    if (pool.length === 0) return false;
+
+    const clip = (t: string): string => t.slice(0, EMBED_MAX_CHARS);
+    const texts = [...new Set([metaText, ...pool.map(s => s.text)].map(clip))];
+    const vectors = await provider.embed(texts);
+    // Any provider can be plugged in, so validate what came back.
+    if (
+      !Array.isArray(vectors) || vectors.length !== texts.length ||
+      !vectors.every(v => Array.isArray(v) && v.length > 0 && v.every(Number.isFinite))
+    ) {
+      throw new Error(`provider returned malformed vectors for ${texts.length} texts`);
+    }
+
+    const vectorOf = new Map(texts.map((t, i) => [t, vectors[i]]));
+    const target = vectorOf.get(clip(metaText)) ?? [];
+    for (const s of pool) {
+      const cosine = SimilarityUtils.cosine(target, vectorOf.get(clip(s.text)) ?? []);
+      s.parts.text = (1 - weight) * s.parts.text + weight * cosine;
+      s.score = this.clampScore(this.blend(s.parts));
+    }
+    scored.sort(byScore);
+    return true;
   }
 
   private scoreNode(
@@ -253,37 +346,30 @@ export class SelfHealingEngine {
     // --- anchor context -----------------------------------------------
     const anchorScore = this.scoreAnchor($, $node, attribs, id, meta);
 
-    // --- blend ---------------------------------------------------------
-    const total =
-      textScore   * this.weights.text +
-      tagScore    * this.weights.tag +
-      idScore     * this.weights.id +
-      classScore  * this.weights.classes +
-      attrScore   * this.weights.attributes +
-      anchorScore * this.weights.anchor;
-
+    const parts = {
+      text: textScore,
+      tag: tagScore,
+      id: idScore,
+      classes: classScore,
+      attributes: attrScore,
+      anchor: anchorScore,
+    };
     return {
       node,
       attribs,
       depth: $node.parents().length,
-      score: this.clampScore(total),
+      score: this.clampScore(this.blend(parts)),
       tagName,
       id,
       classes,
       text,
-      breakdown: {
-        text: Number(textScore.toFixed(4)),
-        tag: Number(tagScore.toFixed(4)),
-        id: Number(idScore.toFixed(4)),
-        classes: Number(classScore.toFixed(4)),
-        attributes: Number(attrScore.toFixed(4)),
-        anchor: Number(anchorScore.toFixed(4)),
-      },
+      parts,
     };
   }
 
   private toCandidate($: cheerio.CheerioAPI, s: ScoredNode): HealCandidate {
     const { selector, nth } = this.buildSelector($, s.node, s.tagName, s.id, s.classes, s.attribs);
+    const round = (v: number): number => Number(v.toFixed(4));
     return {
       selector,
       nth,
@@ -293,7 +379,14 @@ export class SelfHealingEngine {
       id: s.id || undefined,
       classes: s.classes,
       textContent: s.text,
-      breakdown: s.breakdown,
+      breakdown: {
+        text: round(s.parts.text),
+        tag: round(s.parts.tag),
+        id: round(s.parts.id),
+        classes: round(s.parts.classes),
+        attributes: round(s.parts.attributes),
+        anchor: round(s.parts.anchor),
+      },
     };
   }
 

@@ -84,7 +84,7 @@ When a later run's primary selector times out, the engine takes over:
 4. Emits **both** a CSS selector and an XPath, the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express. The CSS form is the most stable strategy that is **unique** on the page. If none is unique, it gets a `>> nth=N` suffix so a look-alike element is never used by mistake.
 5. **Re-captures** the fingerprint from the healed node, so the next mutation scores against up-to-date data instead of the original snapshot. In `readonly` capture mode nothing is written. The heal still happens, but the store is left untouched.
 
-No LLMs, no API keys, no remote service. Every decision is reproducible and inspectable.
+By default: no LLMs, no API keys, no remote service. Every decision is reproducible and inspectable. Embedding similarity is strictly opt-in (see below).
 
 ---
 
@@ -201,6 +201,43 @@ DD_API_KEY=... DD_SITE=datadoghq.eu npm run selfheal -- export reports/ --datado
 
 ---
 
+## Semantic similarity (optional embeddings)
+
+Levenshtein sees "Submit Order" → "Buy now" as almost unrelated. An embedding model sees two ways of saying the same thing. Plug one in and the **text signal** becomes a blend of the two:
+
+```
+text = (1 − w) · levenshtein + w · cosine(embedding(stored text), embedding(candidate text))
+```
+
+```ts
+import { SelfHealingEngine } from './src/healing/SelfHealingEngine';
+import { HttpEmbeddingProvider } from './src/healing/HttpEmbeddingProvider';
+
+const engine = new SelfHealingEngine({
+  embeddings: {
+    // Any OpenAI-compatible /embeddings endpoint: a local Ollama keeps everything offline.
+    provider: new HttpEmbeddingProvider({ url: 'http://localhost:11434/v1/embeddings', model: 'nomic-embed-text' }),
+    weight: 0.5, // share of the text signal from embeddings, [0, 1]
+  },
+});
+```
+
+The demo fixtures switch it on via env: `SELFHEAL_EMBEDDINGS_URL`, `SELFHEAL_EMBEDDINGS_MODEL` (default `nomic-embed-text`), `SELFHEAL_EMBEDDINGS_API_KEY` and `SELFHEAL_EMBEDDINGS_WEIGHT`.
+
+- **Off by default.** Without a provider, the engine makes no network calls, and scores are identical to the lexical engine.
+- **Failure-safe.**
+  - If the provider errors or returns malformed vectors, the heal continues on lexical scores.
+  - The warning is recorded in the heal reason.
+- **Bounded cost.**
+  - One `embed()` call per heal, covering the stored text plus the unique texts of the top 50 lexical candidates (each clipped to 2,000 characters).
+  - Elements without visible text, such as inputs, never trigger a call.
+- **Weight matters.** With the default `0.5`, a rewrite as heavy as "Submit Order" → "Buy now" is lifted (0.38 → 0.57 in our checks) but may not clear the 0.6 threshold on its own. Raising `w` to 0.7–0.8 heals it. Tune it on your own UI before relying on it.
+- **Privacy.** Candidate texts are sent to the endpoint you configure. Point it at a local model if page copy must not leave the machine.
+- **Replay.** Embedding-assisted decisions are marked in reports. `selfheal replay` is lexical-only, so it labels them `semantic` instead of flagging them as changed.
+- **Interface.** Anything implementing `IEmbeddingProvider` (`embed(texts) → number[][]`) can be plugged in.
+
+---
+
 ## Architecture
 
 ```
@@ -231,7 +268,7 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 
 ## Feature highlights
 
-- **Zero-LLM, deterministic healing.** Every heal is replayable and inspectable.
+- **Zero-LLM, deterministic healing by default.** Every heal is replayable and inspectable. Semantic (embedding) similarity is an opt-in plug-in.
 - **Dual selector output.** CSS first; XPath fallback retried at click time if CSS becomes ambiguous.
 - **Shadow DOM aware.** Open shadow roots are scanned and healed into. When a selector matches several elements, the `>> nth=N` index is mapped into Playwright's own piercing order, so the element that was scored is the one that gets clicked.
 - **Strict TypeScript.** `"strict": true`, no `any` escapes, no unused locals/parameters.
@@ -261,7 +298,8 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 src/
 ├── core/SmartPage.ts             Custom Playwright action wrapper
 ├── healing/SelfHealingEngine.ts  Weighted DOM-scoring engine (+ XPath builder)
-├── healing/SimilarityUtils.ts    Levenshtein, Jaccard, tokeniser
+├── healing/SimilarityUtils.ts    Levenshtein, Jaccard, cosine, tokeniser
+├── healing/*EmbeddingProvider.ts Optional semantic similarity (OpenAI-compatible HTTP)
 ├── healing/*.test.ts             Vitest unit tests (pure logic, no browser)
 ├── storage/ElementMetaData.ts    Persistence types
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
@@ -285,8 +323,11 @@ Everything is built around interfaces, so you can substitute any component witho
 // Add a shared remote backend: Redis / DynamoDB / Postgres
 class RedisStore implements IMetadataStore { /* ... */ }
 
-// Subclass the engine to add embedding-based similarity
-class SemanticEngine extends SelfHealingEngine { /* ... */ }
+// Plug in any embedding model (see "Semantic similarity" below)
+class MyEmbeddings implements IEmbeddingProvider { async embed(texts: string[]) { /* ... */ } }
+
+// heal() is async: it may await an embedding provider
+const result = await new SelfHealingEngine().heal(domHtml, storedMeta);
 
 // Tune weights per page type — forms need more anchor signal, buttons more text
 new SelfHealingEngine({
@@ -306,7 +347,7 @@ new SelfHealingEngine({
   - [x] SQLite backend (`node:sqlite`, parallel-worker safe)
   - [x] Healing-replay CLI (`npm run selfheal -- replay reports/`)
 - [x] **Phase 4**: Confidence telemetry exporters for Grafana (Prometheus Pushgateway / textfile) and Datadog (API v2)
-- [ ] **Phase 5** — Optional embedding-based similarity for semantic drift beyond Levenshtein
+- [x] **Phase 5**: Optional embedding-based similarity for semantic drift beyond Levenshtein (any OpenAI-compatible endpoint, including a local Ollama)
 
 ---
 

@@ -261,10 +261,12 @@ export class SmartPage {
 
     let result: HealResult;
     try {
-      result = this.engine.heal(domHtml, meta);
+      result = await this.engine.heal(domHtml, meta);
     } catch (engineErr) {
       return fail(`Healing engine error: ${(engineErr as Error).message}`);
     }
+    if (result.embeddingsUsed) replay.embeddings = true;
+    const warningNote = result.warning ? ` ${result.warning}` : '';
 
     const candidate = result.candidate;
     if (result.healed && candidate) replay.engineSelector = toLocatorString(candidate);
@@ -272,7 +274,7 @@ export class SmartPage {
       return fail(
         `No DOM candidate met the confidence threshold. ` +
           `Best score=${result.confidence.toFixed(3)} ` +
-          `across ${result.candidatesEvaluated} candidates.`,
+          `across ${result.candidatesEvaluated} candidates.${warningNote}`,
         result.confidence,
       );
     }
@@ -324,7 +326,7 @@ export class SmartPage {
         strategy: 'healed',
         reason:
           `Matched "${candidate.textContent}" ` +
-          `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}${runnerUpNote}.`,
+          `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}${runnerUpNote}.${warningNote}`,
         durationMs: 0,
         timestamp,
         replay,
