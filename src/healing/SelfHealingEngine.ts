@@ -208,8 +208,11 @@ export class SelfHealingEngine {
 
     // First pass: nodes that share the expected tag. If none clears the
     // threshold (the element may have been re-tagged while other same-tag
-    // nodes remain), relax to every element in the body.
-    let scored = this.scoreAll($, $(meta.tagName.toLowerCase()).toArray() as CheerioNode[], meta);
+    // nodes remain), relax to every element in the body. Matched by name,
+    // not by selector: a stored tag like `x:btn` is not valid CSS.
+    const tag = meta.tagName.toLowerCase();
+    const sameTag = ($('*').toArray() as CheerioNode[]).filter(n => n.name?.toLowerCase() === tag);
+    let scored = this.scoreAll($, sameTag, meta);
     if (scored.length === 0 || scored[0].score < this.threshold) {
       scored = this.scoreAll($, $('body *').toArray() as CheerioNode[], meta);
     }
@@ -517,14 +520,15 @@ export class SelfHealingEngine {
     classes: string[],
     attrs: Record<string, string>,
   ): { selector: string; nth: number } {
+    const t = this.cssIdent(tag); // e.g. `x:btn` → `x\:btn`
     const strategies = [
       attrs['data-testid'] && `[data-testid="${this.escapeValue(attrs['data-testid'])}"]`,
       attrs['data-test'] && `[data-test="${this.escapeValue(attrs['data-test'])}"]`,
       id && `#${this.cssIdent(id)}`,
-      attrs['aria-label'] && `${tag}[aria-label="${this.escapeValue(attrs['aria-label'])}"]`,
-      attrs['name'] && `${tag}[name="${this.escapeValue(attrs['name'])}"]`,
-      classes.length > 0 && `${tag}${classes.slice(0, 2).map(c => `.${this.cssIdent(c)}`).join('')}`,
-      tag,
+      attrs['aria-label'] && `${t}[aria-label="${this.escapeValue(attrs['aria-label'])}"]`,
+      attrs['name'] && `${t}[name="${this.escapeValue(attrs['name'])}"]`,
+      classes.length > 0 && `${t}${classes.slice(0, 2).map(c => `.${this.cssIdent(c)}`).join('')}`,
+      t,
     ].filter((s): s is string => !!s);
 
     let fallback: { selector: string; nth: number } | undefined;
@@ -540,7 +544,7 @@ export class SelfHealingEngine {
       if (matches.length === 1) return { selector, nth: 0 };
       fallback ??= { selector, nth };
     }
-    return fallback ?? { selector: tag, nth: 0 };
+    return fallback ?? { selector: t, nth: 0 };
   }
 
   /**

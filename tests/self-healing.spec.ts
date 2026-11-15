@@ -11,8 +11,14 @@
  *   metadata, heals the selectors, and retries – the test passes without
  *   any code changes to the POM.
  *
- *   Tests are declared `serial` because Test 2 intentionally relies on the
- *   metadata produced by Test 1.
+ *   Test 3 (Text drift): ids/classes change again AND the visible copy
+ *   drifts ("Submit Order" -> "Place Order").
+ *
+ *   Test 4 (Shadow DOM): the v3 form moves inside an open shadow root of a
+ *   web component with new ids; the engine heals into the shadow tree.
+ *
+ *   Tests are declared `serial` because each one relies on the metadata
+ *   healed by the previous one.
  */
 
 import * as fs from 'fs';
@@ -107,5 +113,33 @@ test.describe('Self-Healing E2E Demo', () => {
     // Confidence will be lower than the pure id/class drift – but still
     // has to clear the configured threshold.
     healed.forEach(h => expect(h.confidence).toBeGreaterThanOrEqual(0.6));
+  });
+
+  test('4. Shadow DOM run: heals into an open shadow root', async ({
+    smartPage,
+    reporter,
+  }) => {
+    const checkout = new CheckoutPage(smartPage);
+
+    // The v3 form now renders inside <checkout-form>'s shadow root, and
+    // every id changed again – invisible to page.content().
+    await checkout.load('/shadow-dom.html');
+    await checkout.fillEmail('alice@example.com');
+    await checkout.fillCoupon('SAVE10');
+    await checkout.submit();
+
+    // The email must have landed in the email field, not a look-alike input.
+    await expect(smartPage.raw.locator('#shadow-feedback')).toHaveText(
+      'Order submitted successfully for alice@example.com!',
+    );
+
+    const healed = reporter.entries.filter(e => e.strategy === 'healed');
+    expect(reporter.entries.filter(e => e.strategy === 'failed')).toHaveLength(0);
+    expect(healed).toHaveLength(3);
+    healed.forEach(h => {
+      expect(h.confidence).toBeGreaterThanOrEqual(0.6);
+      // XPath cannot pierce shadow roots, so every heal must be the CSS form.
+      expect(h.healedSelector).not.toMatch(/^xpath=/);
+    });
   });
 });

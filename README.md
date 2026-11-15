@@ -4,18 +4,19 @@
 >
 > A TypeScript-first Playwright framework that intercepts failing locators, scores every node in the live DOM against a semantic fingerprint, and rewrites broken selectors on the fly — deterministically, offline, zero LLM calls.
 
-![TypeScript](https://img.shields.io/badge/TypeScript-5.4-3178C6?logo=typescript&logoColor=white)
-![Playwright](https://img.shields.io/badge/Playwright-1.45-2EAD33?logo=playwright&logoColor=white)
+![CI](https://github.com/ShantanuVr/playwright-self-healing-framework/actions/workflows/ci.yml/badge.svg)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
+![Playwright](https://img.shields.io/badge/Playwright-1.59-2EAD33?logo=playwright&logoColor=white)
 ![Vitest](https://img.shields.io/badge/Vitest-5.1-6E9F18?logo=vitest&logoColor=white)
 ![Strict TS](https://img.shields.io/badge/strict%20mode-on-success)
-![Tests](https://img.shields.io/badge/35%20unit%20%2B%203%20e2e-passing-success)
+![Tests](https://img.shields.io/badge/117%20unit%20%2B%205%20e2e-passing-success)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
 ## See it heal — in 30 seconds
 
-Same test. Three rewrites of the same page. **Zero maintenance.**
+Same test. Four rewrites of the same page. **Zero maintenance.**
 
 ```ts
 // The test – written once, never changed
@@ -24,13 +25,14 @@ await checkout.fillCoupon('SAVE10');
 await checkout.submit();
 ```
 
-|                         | `original.html`          | `mutated.html`        | `text-drift.html`   |
-| ----------------------- | ------------------------ | --------------------- | ------------------- |
-| submit button `id`      | `#submit-order`          | `#btn_a1b2c3d4`       | `#placeOrderBtn`    |
-| submit button `class`   | `submit-btn`             | `cta-btn primary-cta` | `cta-btn`           |
-| visible text            | `Submit Order`           | `Submit Order`        | **`Place Order`**   |
-| `data-testid`           | `checkout-submit`        | _(removed)_           | _(removed)_         |
-| email label             | `Email address`          | `Email address`       | **`Email`**         |
+|                         | `original.html`          | `mutated.html`        | `text-drift.html`   | `shadow-dom.html`              |
+| ----------------------- | ------------------------ | --------------------- | ------------------- | ------------------------------ |
+| submit button `id`      | `#submit-order`          | `#btn_a1b2c3d4`       | `#placeOrderBtn`    | `#place_k4`                    |
+| submit button `class`   | `submit-btn`             | `cta-btn primary-cta` | `cta-btn`           | `cta-btn`                      |
+| visible text            | `Submit Order`           | `Submit Order`        | **`Place Order`**   | `Place Order`                  |
+| `data-testid`           | `checkout-submit`        | _(removed)_           | _(removed)_         | _(removed)_                    |
+| email label             | `Email address`          | `Email address`       | **`Email`**         | `Email`                        |
+| rendered in             | light DOM                | light DOM             | light DOM           | **a web component's shadow root** |
 
 Heal report produced by the actual test run in this repo:
 
@@ -39,9 +41,10 @@ Heal report produced by the actual test run in this repo:
 [HEALED] checkout.submitButton  #btn_a1b2c3d4                   -> #placeOrderBtn   conf 66.2%
 [HEALED] checkout.emailField    #email-field                    -> #emailAddr_9f3a  conf 87.5%
 [HEALED] checkout.emailField    #emailAddr_9f3a                 -> #email_q7        conf 81.8%
+[HEALED] checkout.submitButton  #placeOrderBtn                  -> #place_k4        conf 96.9%   (inside a shadow root)
 ```
 
-Three DOMs, one test file, six successful heals — and a full JSON audit trail for every decision.
+Four DOMs, one test file, nine successful heals, and a full JSON audit trail for every decision.
 
 ---
 
@@ -102,17 +105,19 @@ npm test
 Expected output:
 
 ```
-Test Files  2 passed (2)                                           Vitest
-     Tests  35 passed (35)  in 266ms
+Test Files  6 passed (6)                                           Vitest
+     Tests  117 passed (117)
 
- ✓ 1. Seed run: captures metadata from the original UI             ( 0.6s)
- ✓ 2. Heal run: recovers from full id/class mutation               (12.3s)
- ✓ 3. Text-drift run: recovers when copy ALSO changes              (12.3s)
+ ✓ Regressions › an action that removes its own element runs exactly once  ( 0.1s)
+ ✓ 1. Seed run: captures metadata from the original UI                      ( 0.1s)
+ ✓ 2. Heal run: recovers from full id/class mutation                        (12.2s)
+ ✓ 3. Text-drift run: recovers when copy ALSO changes                       (12.2s)
+ ✓ 4. Shadow DOM run: heals into an open shadow root                        (12.2s)
 
- 3 passed (26.5s)                                                   Playwright
+ 5 passed (37.7s)                                                            Playwright
 ```
 
-The demo boots a local `http-server` on port `5555`, seeds metadata from `/original.html`, heals on `/mutated.html`, then heals again on `/text-drift.html`.
+The demo boots a local `http-server` on port `5555`, seeds metadata from `/original.html`, heals on `/mutated.html`, heals again on `/text-drift.html`, then follows the form into a web component's shadow root on `/shadow-dom.html`. Each heal takes about 12 s, almost all of it the 4 s action timeout expiring once per broken selector before healing starts.
 
 ---
 
@@ -275,7 +280,7 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 - **SOLID decomposition.** `IMetadataStore` abstracts storage. `SelfHealingEngine` and `StateReporter` are injected collaborators, so each can be subclassed or swapped.
 - **POM-friendly.** Drop into any Page Object suite — supply logical names and optional hints, nothing else.
 - **Full audit trail.** Every interaction logged to console + persisted as JSON with per-signal breakdown, confidence, before/after selector.
-- **35 unit tests and 3 browser scenarios, < 30 s total run.** Engine correctness is not trust-me-bro.
+- **117 unit tests and 5 browser scenarios.** CI runs them on Node 22 and 24, against both storage backends. Engine correctness is not trust-me-bro.
 
 ---
 
@@ -300,17 +305,20 @@ src/
 ├── healing/SelfHealingEngine.ts  Weighted DOM-scoring engine (+ XPath builder)
 ├── healing/SimilarityUtils.ts    Levenshtein, Jaccard, cosine, tokeniser
 ├── healing/*EmbeddingProvider.ts Optional semantic similarity (OpenAI-compatible HTTP)
-├── healing/*.test.ts             Vitest unit tests (pure logic, no browser)
 ├── storage/ElementMetaData.ts    Persistence types
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
 ├── storage/JsonMetadataStore.ts  Default JSON-file backend
 ├── storage/SqliteMetadataStore.ts SQLite backend (node:sqlite, parallel-safe)
 ├── cli/selfheal.ts               `replay` and `export` CLI over heal reports
 ├── telemetry/*Exporter.ts        Prometheus and Datadog confidence exporters
-└── reporting/StateReporter.ts    Console summary + JSON report
+├── reporting/StateReporter.ts    Console summary + JSON report
+└── **/*.test.ts                  Vitest unit tests (no browser)
 pages/CheckoutPage.ts             Sample Page Object
-mock-ui/{original,mutated,text-drift}.html  Fixture UIs with drifting selectors
-tests/self-healing.spec.ts        Seed -> Heal -> Text-Drift e2e demo
+mock-ui/{original,mutated,text-drift,shadow-dom}.html  Fixture UIs with drifting selectors
+mock-ui/self-removing.html        Regression fixture (button that replaces itself)
+tests/self-healing.spec.ts        Seed -> Heal -> Text-Drift -> Shadow DOM e2e demo
+tests/regressions.spec.ts         Browser regression guards
+.github/workflows/ci.yml          Typecheck, unit, e2e (JSON + SQLite), build
 ```
 
 ---
