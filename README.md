@@ -80,8 +80,8 @@ When a later run's primary selector times out, the engine takes over:
    | Classes         | 0.10   | Tokenised Jaccard so `cta-btn` ≈ `btn-cta` despite renames             |
    | Id              | 0.05   | Deliberately low — ids churn first                                     |
 
-3. Accepts the top candidate iff its blended score clears the threshold (default `0.6`).
-4. Emits **both** a CSS selector and an XPath — the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express.
+3. Accepts the top candidate iff its blended score clears the threshold (default `0.6`). If no node with the original tag clears it, the scan widens to every element in `<body>`, since the element may have been re-tagged (`button` → `a`). Ties go to the innermost node, and the runner-up score is recorded in the heal reason.
+4. Emits **both** a CSS selector and an XPath, the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express. The CSS form is the most stable strategy that is **unique** on the page. If none is unique, it gets a `>> nth=N` suffix so a look-alike element is never used by mistake.
 5. **Re-captures** the fingerprint from the healed node, so the next mutation scores against up-to-date data instead of the original snapshot. In `readonly` capture mode nothing is written. The heal still happens, but the store is left untouched.
 
 No LLMs, no API keys, no remote service. Every decision is reproducible and inspectable.
@@ -223,6 +223,7 @@ new SelfHealingEngine({
 - The JSON store is single-writer. Run one Playwright worker (the default config does); parallel workers would overwrite each other's records.
 - The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.
 - Re-capture on heal trusts the first accepted candidate. A post-test verification hook would close the false-positive window.
+- Elements without visible text, such as form inputs, all score a full 1.0 on the text signal against each other. A look-alike field can therefore clear the threshold if the real one disappears; in the demo, the coupon input scores 0.70 against the email fingerprint. Every heal reason records the runner-up score so these near-ties show up. A proper fix re-weights uninformative signals, and that needs a mutation benchmark first.
 
 ---
 
