@@ -100,6 +100,9 @@ export interface HealCandidate {
 export interface HealResult {
   healed: boolean;
   confidence: number;
+  /** The winner's CSS selector, runner-agnostic. It may also match
+   *  look-alikes: `candidate.nth` says which match is meant, and
+   *  {@link toLocatorString} combines the two for Playwright. */
   selector?: string;
   candidate?: HealCandidate;
   candidatesEvaluated: number;
@@ -113,8 +116,16 @@ export interface HealResult {
 
 export interface EmbeddingOptions {
   provider: IEmbeddingProvider;
-  /** Share of the text signal taken from embedding cosine similarity, in [0, 1]. Default 0.5. */
+  /** Share of the text signal taken from embedding similarity, in [0, 1]. Default 0.5. */
   weight?: number;
+  /**
+   * Cosine at or below which two texts count as unrelated, in [0, 1).
+   * Default 0.5. Real models give unrelated short texts a cosine of roughly
+   * 0.3–0.6, so raw cosine would lift every wrong candidate; similarity is
+   * rescaled as `max(0, (cosine − baseline) / (1 − baseline))`. Lower it
+   * for models with low baseline similarity, raise it for high ones.
+   */
+  baseline?: number;
 }
 
 export interface SelfHealingEngineOptions {
@@ -154,6 +165,27 @@ interface ScoredNode {
  *  only content is the target cannot outrank the target itself. */
 const byScore = (a: ScoredNode, b: ScoredNode): number => b.score - a.score || b.depth - a.depth;
 
+/** Siblings considered on EACH side of an element, by capture and engine alike. */
+export const SIBLING_WINDOW = 5;
+
+/** `label[for]` → label text, built once per parsed DOM (first label wins,
+ *  like `querySelector`) instead of one document scan per candidate. */
+const labelIndex = new WeakMap<cheerio.CheerioAPI, Map<string, string>>();
+function labelsByFor($: cheerio.CheerioAPI): Map<string, string> {
+  let index = labelIndex.get($);
+  if (!index) {
+    index = new Map();
+    for (const el of $('label[for]').toArray()) {
+      const target = $(el).attr('for');
+      if (target !== undefined && !index.has(target)) {
+        index.set(target, $(el).text().replace(/\s+/g, ' ').trim());
+      }
+    }
+    labelIndex.set($, index);
+  }
+  return index;
+}
+
 // shortcut: only the top 50 lexical candidates are embedded; raise if semantic matches rank lower.
 const EMBED_POOL = 50;
 // Container texts can be huge; clip so no input blows an endpoint's per-input token limit.
@@ -189,11 +221,14 @@ export class SelfHealingEngine {
     this.threshold = options.threshold ?? 0.6;
     this.topN = options.topN ?? 5;
     if (options.embeddings) {
-      const weight = options.embeddings.weight ?? 0.5;
+      const { provider, weight = 0.5, baseline = 0.5 } = options.embeddings;
       if (!(weight >= 0 && weight <= 1)) {
         throw new Error(`[SelfHealingEngine] embeddings.weight must be in [0, 1], got ${weight}`);
       }
-      this.embeddings = { provider: options.embeddings.provider, weight };
+      if (!(baseline >= 0 && baseline < 1)) {
+        throw new Error(`[SelfHealingEngine] embeddings.baseline must be in [0, 1), got ${baseline}`);
+      }
+      this.embeddings = { provider, weight, baseline };
     }
   }
 
@@ -210,22 +245,30 @@ export class SelfHealingEngine {
     // threshold (the element may have been re-tagged while other same-tag
     // nodes remain), relax to every element in the body. Matched by name,
     // not by selector: a stored tag like `x:btn` is not valid CSS.
-    const tag = meta.tagName.toLowerCase();
-    const sameTag = ($('*').toArray() as CheerioNode[]).filter(n => n.name?.toLowerCase() === tag);
-    let scored = this.scoreAll($, sameTag, meta);
-    if (scored.length === 0 || scored[0].score < this.threshold) {
-      scored = this.scoreAll($, $('body *').toArray() as CheerioNode[], meta);
-    }
-
+    const metaText = meta.textContent.trim();
     let embeddingsUsed = false;
     let warning: string | undefined;
-    if (this.embeddings && meta.textContent.trim()) {
-      try {
-        embeddingsUsed = await this.blendEmbeddings(scored, meta.textContent.trim(), this.embeddings);
-      } catch (err) {
-        // Never fail a heal because the provider is down: keep lexical scores.
-        warning = `Embedding provider failed, kept lexical text scores: ${(err as Error).message}`;
+    // Lexical scores, plus the embedding blend when configured – applied per
+    // pass, so a reworded same-tag element can heal before the scan widens.
+    const rank = async (nodes: CheerioNode[]): Promise<ScoredNode[]> => {
+      const scored = this.scoreAll($, nodes, meta);
+      embeddingsUsed = false;
+      if (this.embeddings && metaText && !warning) {
+        try {
+          embeddingsUsed = await this.blendEmbeddings(scored, metaText, this.embeddings);
+        } catch (err) {
+          // Never fail a heal because the provider is down: keep lexical scores.
+          warning = `Embedding provider failed, kept lexical text scores: ${(err as Error).message}`;
+        }
       }
+      return scored;
+    };
+
+    const tag = meta.tagName.toLowerCase();
+    const sameTag = ($('*').toArray() as CheerioNode[]).filter(n => n.name?.toLowerCase() === tag);
+    let scored = await rank(sameTag);
+    if (scored.length === 0 || scored[0].score < this.threshold) {
+      scored = await rank($('body *').toArray() as CheerioNode[]);
     }
 
     // Selectors are only built for the nodes we report – each one runs
@@ -275,14 +318,15 @@ export class SelfHealingEngine {
   }
 
   /**
-   * Blend embedding cosine similarity into the text signal of the top
-   * lexical candidates (`text = (1-w)·levenshtein + w·cosine`), re-score and
-   * re-sort `scored` in place. Returns false when nothing could be embedded.
+   * Blend embedding similarity into the text signal of the top lexical
+   * candidates (`text = (1-w)·levenshtein + w·similarity`, where similarity
+   * is the cosine rescaled above `baseline`), re-score and re-sort `scored`
+   * in place. Returns false when nothing could be embedded.
    */
   private async blendEmbeddings(
     scored: ScoredNode[],
     metaText: string,
-    { provider, weight }: Required<EmbeddingOptions>,
+    { provider, weight, baseline }: Required<EmbeddingOptions>,
   ): Promise<boolean> {
     const pool = scored.slice(0, EMBED_POOL).filter(s => s.text);
     if (pool.length === 0) return false;
@@ -302,7 +346,8 @@ export class SelfHealingEngine {
     const target = vectorOf.get(clip(metaText)) ?? [];
     for (const s of pool) {
       const cosine = SimilarityUtils.cosine(target, vectorOf.get(clip(s.text)) ?? []);
-      s.parts.text = (1 - weight) * s.parts.text + weight * cosine;
+      const similarity = Math.max(0, (cosine - baseline) / (1 - baseline));
+      s.parts.text = (1 - weight) * s.parts.text + weight * similarity;
       s.score = this.clampScore(this.blend(s.parts));
     }
     scored.sort(byScore);
@@ -465,13 +510,17 @@ export class SelfHealingEngine {
     );
 
     // Sibling text overlap – tokenised Jaccard so small wording changes
-    // do not destroy the match.
-    const siblingTexts: string[] = [];
-    $parent.children().each((_: number, el: cheerio.Element) => {
-      if (el === ($node.get(0) as unknown)) return;
-      const t = $(el).text().trim();
-      if (t) siblingTexts.push(t);
-    });
+    // do not destroy the match. Only the nearest SIBLING_WINDOW siblings on
+    // each side count (the browser capture uses the same window): reading
+    // every sibling is quadratic in long lists, and far-away rows are noise.
+    const siblings = $parent.children().toArray();
+    const at = siblings.indexOf($node.get(0) as cheerio.Element);
+    const siblingTexts = [
+      ...siblings.slice(Math.max(0, at - SIBLING_WINDOW), at),
+      ...siblings.slice(at + 1, at + 1 + SIBLING_WINDOW),
+    ]
+      .map(el => $(el).text().trim())
+      .filter(Boolean);
     const siblingScore = SimilarityUtils.jaccard(
       siblingTexts.flatMap(t => SimilarityUtils.tokenize(t)),
       (ctx.siblingTexts ?? []).flatMap(t => SimilarityUtils.tokenize(t)),
@@ -492,8 +541,8 @@ export class SelfHealingEngine {
     id: string,
   ): string {
     if (id) {
-      const byFor = $(`label[for="${this.escapeValue(id)}"]`).first();
-      if (byFor.length) return byFor.text().replace(/\s+/g, ' ').trim();
+      const byFor = labelsByFor($).get(id);
+      if (byFor !== undefined) return byFor;
     }
     const wrapping = $node.parents('label').first();
     if (wrapping.length) return wrapping.text().replace(/\s+/g, ' ').trim();
@@ -594,7 +643,12 @@ export class SelfHealingEngine {
   }
 
   private escapeValue(value: string): string {
-    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    // CSS strings cannot hold raw line breaks; `\a ` / `\d ` are their escapes.
+    return value
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, '\\a ')
+      .replace(/\r/g, '\\d ');
   }
 
   /**

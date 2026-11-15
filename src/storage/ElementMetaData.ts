@@ -26,7 +26,7 @@ export interface AnchorContext {
   siblingTexts: string[];
   /** ARIA-label on the element itself, if any. */
   ariaLabel?: string;
-  /** ARIA-role on the element itself, if any. */
+  /** ARIA-role on the element itself, if any. Recorded for diagnostics; not scored. */
   role?: string;
   /** `data-testid` attribute – the most stable signal when present. */
   dataTestId?: string;
@@ -60,7 +60,8 @@ export interface ElementMetaData {
   anchorContext: AnchorContext;
   /** ISO timestamp of the last successful capture. */
   capturedAt: string;
-  /** URL pathname so the same logical name can exist on multiple pages. */
+  /** URL pathname at capture time – diagnostics only. Stores are keyed by
+   *  logical name alone, so give elements on different pages distinct names. */
   pageUrlPattern?: string;
   /** Rolling audit log of selectors that previously pointed here. */
   healedFrom?: string[];

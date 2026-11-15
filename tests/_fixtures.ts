@@ -11,7 +11,6 @@ import { SmartPage } from '../src/core/SmartPage';
 import { SelfHealingEngine } from '../src/healing/SelfHealingEngine';
 import { HttpEmbeddingProvider } from '../src/healing/HttpEmbeddingProvider';
 import { JsonMetadataStore } from '../src/storage/JsonMetadataStore';
-import { SqliteMetadataStore } from '../src/storage/SqliteMetadataStore';
 import { IMetadataStore } from '../src/storage/IMetadataStore';
 import { StateReporter } from '../src/reporting/StateReporter';
 
@@ -30,12 +29,21 @@ interface HealingFixtures {
 
 export const test = base.extend<HealingFixtures>({
   store: async ({}, use) => {
-    const store = /\.(db|sqlite)$/.test(STORAGE_PATH)
-      ? new SqliteMetadataStore(STORAGE_PATH)
-      : new JsonMetadataStore(STORAGE_PATH);
+    if (/\.(db|sqlite)$/.test(STORAGE_PATH)) {
+      // Loaded lazily: importing node:sqlite prints an ExperimentalWarning,
+      // which JSON-store runs should not see. `require`, not `import()`:
+      // Playwright only transpiles TypeScript on the CommonJS path.
+      const { SqliteMetadataStore } =
+        require('../src/storage/SqliteMetadataStore') as typeof import('../src/storage/SqliteMetadataStore');
+      const store = new SqliteMetadataStore(STORAGE_PATH);
+      await store.load();
+      await use(store);
+      store.close();
+      return;
+    }
+    const store = new JsonMetadataStore(STORAGE_PATH);
     await store.load();
     await use(store);
-    if (store instanceof SqliteMetadataStore) store.close();
   },
 
   engine: async ({}, use) => {
@@ -52,9 +60,12 @@ export const test = base.extend<HealingFixtures>({
                   model: process.env.SELFHEAL_EMBEDDINGS_MODEL ?? 'nomic-embed-text',
                   apiKey: process.env.SELFHEAL_EMBEDDINGS_API_KEY,
                 }),
-                // Validated by the engine (must be in [0, 1]); default 0.5.
+                // Both validated by the engine; defaults 0.5 / 0.5.
                 weight: process.env.SELFHEAL_EMBEDDINGS_WEIGHT
                   ? Number(process.env.SELFHEAL_EMBEDDINGS_WEIGHT)
+                  : undefined,
+                baseline: process.env.SELFHEAL_EMBEDDINGS_BASELINE
+                  ? Number(process.env.SELFHEAL_EMBEDDINGS_BASELINE)
                   : undefined,
               },
             }

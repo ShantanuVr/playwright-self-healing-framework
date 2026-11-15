@@ -10,8 +10,8 @@
   "scripts": {
     "postinstall": "playwright install chromium",
     "typecheck": "tsc --noEmit",
-    "build": "tsc",
-    "selfheal": "tsc && node dist/src/cli/selfheal.js",
+    "build": "tsc -p tsconfig.build.json",
+    "selfheal": "tsc -p tsconfig.build.json && node dist/src/cli/selfheal.js",
     "test": "npm run test:unit && npm run test:e2e",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
@@ -31,7 +31,6 @@
   "devDependencies": {
     "@playwright/test": "^1.45.0",
     "@types/node": "^22.13.0",
-    "http-server": "^14.1.1",
     "typescript": "^5.4.0",
     "vitest": "^5.1.0"
   },

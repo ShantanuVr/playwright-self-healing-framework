@@ -345,3 +345,56 @@ describe('SelfHealingEngine.heal – optional embeddings', () => {
     expect(() => new SelfHealingEngine({ embeddings: { provider, weight: Number.NaN } })).toThrow(/weight/);
   });
 });
+
+describe('SelfHealingEngine – audit fixes', () => {
+  it('scores only the nearest siblings (window of 5 on each side)', async () => {
+    const items = Array.from({ length: 30 }, (_, i) => `<li><span>Item ${i}</span></li>`);
+    items[15] = '<li><button class="pick">Pick</button></li>';
+    const dom = `<ul>${items.join('')}</ul>`;
+    // The stored context holds exactly the 10 neighbours, as the capture records them.
+    const near = [10, 11, 12, 13, 14, 16, 17, 18, 19, 20].map(i => `Item ${i}`);
+    // Target the <li> (its siblings are the other <li>s); with all 29 siblings
+    // counted, the sibling Jaccard would be 11/30 and the anchor would drop.
+    const meta = bareMeta({ tagName: 'li', textContent: 'Pick', classes: [], attributes: {}, anchorContext: { siblingTexts: near } });
+    const result = await new SelfHealingEngine().heal(dom, meta);
+    expect(result.candidate?.textContent).toBe('Pick');
+    expect(result.candidate?.breakdown.anchor).toBe(1);
+  });
+
+  it('escapes line breaks inside attribute values', async () => {
+    const dom = `<button aria-label="Pay\nnow" class="btn">Pay</button><button class="btn">Pay</button>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta({ attributes: { class: 'btn', 'aria-label': 'Pay\nnow' }, anchorContext: { siblingTexts: [], ariaLabel: 'Pay\nnow' } }));
+    expect(result.candidate?.selector).toBe('button[aria-label="Pay\\a now"]');
+    expect(result.candidate?.selector).not.toContain('\n');
+  });
+
+  it('treats cosine at or below the baseline as no similarity at all', async () => {
+    // Every text gets the same vector except the target, which sits at cosine 0.5.
+    const provider: IEmbeddingProvider = {
+      embed: async texts => texts.map(t => (t === 'Submit Order' ? [1, 0] : [0.5, Math.sqrt(0.75)])),
+    };
+    const blended = await new SelfHealingEngine({ embeddings: { provider, weight: 0.5, baseline: 0.5 } })
+      .heal(`<div class="actions"><button id="x1" class="btn">Buy now</button></div>`, metaFromOriginal());
+    expect(blended.embeddingsUsed).toBe(true);
+    // Cosine 0.5 with baseline 0.5 → similarity 0: the text signal can only drop.
+    expect(blended.topCandidates[0].breakdown.text).toBeLessThan(0.1); // raw cosine would give ~0.33
+    expect(() => new SelfHealingEngine({ embeddings: { provider, baseline: 1 } })).toThrow(/baseline/);
+  });
+
+  it('blends embeddings before deciding to widen the scan', async () => {
+    const calls: string[][] = [];
+    const provider: IEmbeddingProvider = {
+      embed: async texts => {
+        calls.push(texts);
+        return texts.map(t => (t === 'Submit Order' || t === 'Buy now' ? [1, 0] : [0, 1]));
+      },
+    };
+    const dom = `<section><h2>Your basket total</h2><div class="actions"><button id="x1" class="btn">Buy now</button><button id="x2" class="btn">Cancel</button></div></section>`;
+    const result = await new SelfHealingEngine({ embeddings: { provider, weight: 0.8 } }).heal(dom, metaFromOriginal());
+    expect(result.healed).toBe(true);
+    expect(result.candidate?.textContent).toBe('Buy now');
+    // Healed within the same-tag pass: no widened scan, no container texts embedded.
+    expect(calls).toHaveLength(1);
+    expect(result.candidatesEvaluated).toBe(2);
+  });
+});
