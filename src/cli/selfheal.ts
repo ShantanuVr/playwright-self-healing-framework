@@ -8,9 +8,12 @@
  *                            browser, on every recorded heal attempt and
  *                            flag decisions that would change – e.g. after
  *                            tuning weights or the threshold.
+ *   export <report|dir>...   Turn the outcomes into confidence telemetry for
+ *                            Grafana (Prometheus) and/or Datadog.
  *
- * Exit codes: 0 = nothing changed, 1 = a decision changed (or the engine
- * failed on a recorded DOM), 2 = bad arguments or unreadable reports.
+ * Exit codes – replay: 0 = nothing changed, 1 = a decision changed (or the
+ * engine failed on a recorded DOM); export: 0 = exported, 1 = an export
+ * failed; both: 2 = bad arguments or unreadable reports.
  */
 
 import * as fs from 'fs';
@@ -23,11 +26,23 @@ import {
   toLocatorString,
 } from '../healing/SelfHealingEngine';
 import { HealingOutcome } from '../storage/ElementMetaData';
+import { ITelemetryExporter } from '../telemetry/ITelemetryExporter';
+import { PrometheusExporter } from '../telemetry/PrometheusExporter';
+import { DatadogExporter } from '../telemetry/DatadogExporter';
 
 type Print = (line: string) => void;
 
 const USAGE = `Usage:
-  selfheal replay <report.json|dir>... [--threshold N] [--weights JSON] [--top N]`;
+  selfheal replay <report.json|dir>... [--threshold N] [--weights JSON] [--top N]
+  selfheal export <report.json|dir>... [--prometheus-file PATH] [--pushgateway URL] [--job NAME] [--datadog]
+
+  export with no target prints Prometheus text to stdout.
+  --datadog reads DD_API_KEY (required) and DD_SITE (default datadoghq.com) from the environment.`;
+
+const COMMAND_FLAGS: Record<'replay' | 'export', string[]> = {
+  replay: ['threshold', 'weights', 'top'],
+  export: ['prometheus-file', 'pushgateway', 'job', 'datadog'],
+};
 
 const SIGNALS: Array<keyof HealingWeights> = ['text', 'tag', 'id', 'classes', 'attributes', 'anchor'];
 
@@ -143,6 +158,40 @@ function replay(
   return changed > 0 ? 1 : 0;
 }
 
+function parseHttpUrl(name: string, raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`--${name} must be an http(s) URL, got "${raw}"`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`--${name} must be an http(s) URL, got "${raw}"`);
+  }
+  return raw;
+}
+
+/** Runs every exporter; a failing target is reported but does not stop the others. */
+async function runExports(
+  targets: Array<{ label: string; exporter: ITelemetryExporter }>,
+  outcomes: HealingOutcome[],
+  out: Print,
+  err: Print,
+): Promise<number> {
+  let failed = 0;
+  for (const { label, exporter } of targets) {
+    try {
+      await exporter.export(outcomes);
+      out(`Exported ${outcomes.length} outcome(s) to ${label}.`);
+    } catch (e) {
+      failed++;
+      err(`selfheal: export to ${label} failed: ${(e as Error).message}`);
+    }
+  }
+  return failed > 0 ? 1 : 0;
+}
+
 export async function main(
   argv: string[],
   out: Print = console.log,
@@ -156,6 +205,10 @@ export async function main(
         threshold: { type: 'string' },
         weights: { type: 'string' },
         top: { type: 'string' },
+        'prometheus-file': { type: 'string' },
+        pushgateway: { type: 'string' },
+        job: { type: 'string' },
+        datadog: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     });
@@ -164,17 +217,47 @@ export async function main(
       out(USAGE);
       return 0;
     }
-    if (command !== 'replay') {
+    if (command !== 'replay' && command !== 'export') {
       throw new Error(command ? `unknown command "${command}"` : 'missing command');
     }
-    if (inputs.length === 0) throw new Error('replay needs at least one report file or directory');
+    const stray = Object.keys(values).find(k => k !== 'help' && !COMMAND_FLAGS[command].includes(k));
+    if (stray) throw new Error(`--${stray} is not an option of "${command}"`);
+    if (inputs.length === 0) throw new Error(`${command} needs at least one report file or directory`);
 
-    const engine = new SelfHealingEngine({
-      threshold: parseNumber('threshold', values.threshold, 0, 1),
-      weights: parseWeights(values.weights),
-      topN: parseNumber('top', values.top, 0, 50, true),
-    });
-    return replay(inputs, engine, out);
+    if (command === 'replay') {
+      const engine = new SelfHealingEngine({
+        threshold: parseNumber('threshold', values.threshold, 0, 1),
+        weights: parseWeights(values.weights),
+        topN: parseNumber('top', values.top, 0, 50, true),
+      });
+      return replay(inputs, engine, out);
+    }
+
+    const outcomes = loadReports(inputs).flatMap(r => r.outcomes);
+    const targets: Array<{ label: string; exporter: ITelemetryExporter }> = [];
+    const pushgatewayUrl = parseHttpUrl('pushgateway', values.pushgateway);
+    const filePath = values['prometheus-file'];
+    if (values.job !== undefined && !pushgatewayUrl) {
+      throw new Error('--job only applies with --pushgateway');
+    }
+    if (filePath || pushgatewayUrl) {
+      targets.push({
+        label: [filePath, pushgatewayUrl].filter(Boolean).join(' + '),
+        exporter: new PrometheusExporter({ filePath, pushgatewayUrl, job: values.job }),
+      });
+    }
+    if (values.datadog) {
+      const site = process.env.DD_SITE || undefined;
+      targets.push({
+        label: `Datadog (${site ?? 'datadoghq.com'})`,
+        exporter: new DatadogExporter({ apiKey: process.env.DD_API_KEY ?? '', site }),
+      });
+    }
+    if (targets.length === 0) {
+      out(new PrometheusExporter().render(outcomes).trimEnd());
+      return 0;
+    }
+    return runExports(targets, outcomes, out, err);
   } catch (e) {
     err(`selfheal: ${(e as Error).message}\n${USAGE}`);
     return 2;

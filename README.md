@@ -162,6 +162,45 @@ Exit codes:
 
 ---
 
+## Confidence telemetry (Grafana / Datadog)
+
+`selfheal export` turns heal reports into two gauges. Every backend gets the same numbers:
+
+| Metric (Prometheus / Datadog) | Labels / tags | Value |
+| ----------------------------- | ------------- | ----- |
+| `selfheal_interactions` / `selfheal.interactions` | `strategy` (`exact`, `healed`, `failed`) | Interactions in the exported reports |
+| `selfheal_heal_confidence` / `selfheal.heal.confidence` | `logical_name`, `strategy` | Lowest confidence among that element's non-exact outcomes, i.e. the weakest heal |
+
+Alert when `selfheal_heal_confidence` drifts toward your threshold. That means an element is about to stop healing, so it's time to update its selector deliberately. Only `strategy` and `logical_name` ever become labels. Cardinality stays bounded, and no selector, page text or DOM leaves the machine.
+
+```bash
+npm run clean && npm run test:e2e   # export aggregates exactly the files you pass, so start from one run's reports
+
+npm run selfheal -- export reports/                                                # dry run: Prometheus text on stdout
+npm run selfheal -- export reports/ --pushgateway http://localhost:9091 --job checkout-e2e   # Prometheus → Grafana
+npm run selfheal -- export reports/ --prometheus-file /var/lib/node_exporter/textfile/selfheal.prom
+DD_API_KEY=... DD_SITE=datadoghq.eu npm run selfheal -- export reports/ --datadog
+```
+
+- **Pushgateway.**
+  - `PUT /metrics/job@base64/<job>` replaces the job's group on every push.
+  - The job name is base64-encoded in the URL, so any name works.
+  - No timestamps are sent, because the Pushgateway rejects them.
+- **File.** The exposition is written atomically (temp file + rename), so node_exporter's textfile collector never reads a partial file.
+- **Datadog.**
+  - Metrics go through API v2 `POST /api/v2/series` as gauges, so no Agent is needed in CI.
+  - Points are stamped with the export time, because Datadog rejects points older than one hour.
+  - The API key comes from `DD_API_KEY` only, never from a flag.
+  - `DD_SITE` must be a Datadog domain, so a typo can't send your key elsewhere.
+  - Datadog lowercases tag values.
+- **Programmatic use.** Call `new PrometheusExporter({ pushgatewayUrl }).export(outcomes)` or `new DatadogExporter({ apiKey }).export(outcomes)`, for example from a Playwright `globalTeardown`. Both implement `ITelemetryExporter`.
+- **Exit codes:**
+  - `0`: exported;
+  - `1`: an export failed (the other targets still run);
+  - `2`: bad arguments or reports.
+
+---
+
 ## Architecture
 
 ```
@@ -228,7 +267,8 @@ src/
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
 ├── storage/JsonMetadataStore.ts  Default JSON-file backend
 ├── storage/SqliteMetadataStore.ts SQLite backend (node:sqlite, parallel-safe)
-├── cli/selfheal.ts               Healing-replay CLI over heal reports
+├── cli/selfheal.ts               `replay` and `export` CLI over heal reports
+├── telemetry/*Exporter.ts        Prometheus and Datadog confidence exporters
 └── reporting/StateReporter.ts    Console summary + JSON report
 pages/CheckoutPage.ts             Sample Page Object
 mock-ui/{original,mutated,text-drift}.html  Fixture UIs with drifting selectors
@@ -265,7 +305,7 @@ new SelfHealingEngine({
   - [x] Shadow DOM scanning (open shadow roots)
   - [x] SQLite backend (`node:sqlite`, parallel-worker safe)
   - [x] Healing-replay CLI (`npm run selfheal -- replay reports/`)
-- [ ] **Phase 4** — Confidence telemetry exporter for Grafana / Datadog
+- [x] **Phase 4**: Confidence telemetry exporters for Grafana (Prometheus Pushgateway / textfile) and Datadog (API v2)
 - [ ] **Phase 5** — Optional embedding-based similarity for semantic drift beyond Levenshtein
 
 ---
