@@ -68,7 +68,7 @@ Just before every interaction (in the default `auto` capture mode), the wrapper 
 
 When a later run's primary selector times out, the engine takes over:
 
-1. Grabs the DOM with `page.content()` and parses it with cheerio — no browser re-render.
+1. Serialises the live DOM, inlining every **open shadow root** into its host, and parses it with cheerio, with no browser re-render. The copy is built in an inert document, so component constructors don't re-run and media doesn't load.
 2. Scores every candidate node using **six normalised sub-scores in `[0, 1]`**:
 
    | Signal          | Weight | Why it matters                                                         |
@@ -146,6 +146,7 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 
 - **Zero-LLM, deterministic healing.** Every heal is replayable and inspectable.
 - **Dual selector output.** CSS first; XPath fallback retried at click time if CSS becomes ambiguous.
+- **Shadow DOM aware.** Open shadow roots are scanned and healed into. When a selector matches several elements, the `>> nth=N` index is mapped into Playwright's own piercing order, so the element that was scored is the one that gets clicked.
 - **Strict TypeScript.** `"strict": true`, no `any` escapes, no unused locals/parameters.
 - **SOLID decomposition.** `IMetadataStore` abstracts storage. `SelfHealingEngine` and `StateReporter` are injected collaborators, so each can be subclassed or swapped.
 - **POM-friendly.** Drop into any Page Object suite — supply logical names and optional hints, nothing else.
@@ -210,7 +211,10 @@ new SelfHealingEngine({
 
 - [x] **Phase 1** — JSON store, 6-signal heuristic, CSS selector heal, mock UI demo
 - [x] **Phase 2** — XPath fallback, fresh-on-heal recapture, full Vitest harness, text-drift scenario
-- [ ] **Phase 3** — Shadow DOM scanning, SQLite backend, healing-replay CLI
+- [ ] **Phase 3**
+  - [x] Shadow DOM scanning (open shadow roots)
+  - [ ] SQLite backend
+  - [ ] Healing-replay CLI
 - [ ] **Phase 4** — Confidence telemetry exporter for Grafana / Datadog
 - [ ] **Phase 5** — Optional embedding-based similarity for semantic drift beyond Levenshtein
 
@@ -218,7 +222,8 @@ new SelfHealingEngine({
 
 ## Known limitations (honesty section)
 
-- Shadow DOM / cross-origin iframes are not scanned — cheerio parses `page.content()` only.
+- Closed shadow roots and cross-origin iframes are not scanned. Open shadow roots are: the CSS heal pierces them, but the XPath fallback cannot reach shadow content, because XPath does not pierce shadow roots.
+- Slotted light-DOM content is scored in its light-DOM position, after the host's shadow children, rather than distributed into its `<slot>`.
 - Metadata lives on disk per checkout; a remote backend (SQLite / Redis) is still a Phase 3 item.
 - The JSON store is single-writer. Run one Playwright worker (the default config does); parallel workers would overwrite each other's records.
 - The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.
