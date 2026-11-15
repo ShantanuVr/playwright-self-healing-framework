@@ -7,7 +7,8 @@ import * as path from 'path';
  * - `workers: 1` ensures our storage/reporter singletons stay consistent
  *   across the two sample tests which intentionally share state
  *   (seed run -> heal run).
- * - A local `http-server` is booted to serve the `mock-ui/` fixtures.
+ * - A tiny built-in static server (scripts/serve-static.js) serves the
+ *   `mock-ui/` fixtures.
  */
 const MOCK_UI_PORT = Number(process.env.MOCK_UI_PORT ?? 5555);
 
@@ -36,8 +37,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npx http-server ${path.resolve(__dirname, 'mock-ui')} -p ${MOCK_UI_PORT} -c-1 --silent`,
-    port: MOCK_UI_PORT,
+    command: `node ${path.resolve(__dirname, 'scripts/serve-static.js')} ${path.resolve(__dirname, 'mock-ui')} ${MOCK_UI_PORT}`,
+    url: `http://127.0.0.1:${MOCK_UI_PORT}/original.html`,
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,
   },

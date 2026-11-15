@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Self-Healing Demo - Checkout v4 (Shadow DOM)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      COMPONENT MIGRATION: the v3 checkout now lives inside an OPEN shadow
+      root of a <checkout-form> web component, and every id changed again.
+      `page.content()` cannot see any of it; the engine heals into the
+      shadow tree, and only the CSS form of the healed selector can reach
+      it (XPath does not pierce shadow roots).
+    -->
+    <style>
+      :root { color-scheme: light; }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #f8fafc;
+        color: #0f172a;
+        padding: 40px;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <checkout-form></checkout-form>
+
+    <template id="checkout-form-template">
+      <style>
+        * { box-sizing: border-box; }
+        .wrap {
+          max-width: 520px;
+          margin: 0 auto;
+          background: #fff;
+          padding: 32px;
+          border-radius: 10px;
+          box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+        }
+        h1 { margin: 0 0 6px; color: #1e293b; font-size: 22px; }
+        .sub { color: #64748b; margin-bottom: 24px; font-size: 14px; }
+        label { display: block; font-weight: 600; margin: 14px 0 6px; color: #334155; font-size: 14px; }
+        input {
+          width: 100%;
+          padding: 10px 12px;
+          border: 1px solid #cbd5e1;
+          border-radius: 6px;
+          font-size: 14px;
+        }
+        input:focus { outline: 2px solid #2563eb; outline-offset: 1px; }
+        .actions { display: flex; gap: 12px; margin-top: 20px; }
+        button {
+          flex: 1;
+          padding: 11px 16px;
+          border: none;
+          border-radius: 6px;
+          cursor: pointer;
+          font-weight: 600;
+          font-size: 14px;
+        }
+        .cta-btn { background: #2563eb; color: white; }
+        .cta-btn:hover { background: #1d4ed8; }
+        .secondary-btn { background: #e2e8f0; color: #475569; }
+        .secondary-btn:hover { background: #cbd5e1; }
+        .status {
+          margin-top: 18px;
+          font-weight: 600;
+          color: #166534;
+          min-height: 20px;
+        }
+      </style>
+      <div class="wrap">
+        <h1>Checkout (v4 - Shadow DOM)</h1>
+        <div class="sub">Same copy as v3, but rendered inside a web component's shadow root with new ids.</div>
+
+        <form id="order-form-v4">
+          <label for="mail_k2">Email</label>
+          <input
+            id="mail_k2"
+            name="contact_email"
+            class="form-control"
+            type="email"
+            placeholder="you@example.com"
+          />
+
+          <label for="promo_k3">Promo code</label>
+          <input
+            id="promo_k3"
+            name="promo_code"
+            class="form-control"
+            type="text"
+            placeholder="SAVE10"
+          />
+
+          <div class="actions">
+            <button id="place_k4" class="cta-btn" type="button">
+              Place Order
+            </button>
+            <button id="back_k5" class="secondary-btn" type="button">Back</button>
+          </div>
+        </form>
+
+        <p id="shadow-feedback" class="status"></p>
+      </div>
+    </template>
+
+    <script>
+      customElements.define(
+        'checkout-form',
+        class extends HTMLElement {
+          constructor() {
+            super();
+            const root = this.attachShadow({ mode: 'open' });
+            root.appendChild(document.getElementById('checkout-form-template').content.cloneNode(true));
+            const feedback = root.getElementById('shadow-feedback');
+            root.getElementById('place_k4').addEventListener('click', () => {
+              const email = root.getElementById('mail_k2').value;
+              feedback.textContent = email
+                ? `Order submitted successfully for ${email}!`
+                : 'Order submitted successfully!';
+            });
+            root.getElementById('back_k5').addEventListener('click', () => {
+              feedback.textContent = 'Order cancelled.';
+            });
+          }
+        },
+      );
+    </script>
+  </body>
+</html>

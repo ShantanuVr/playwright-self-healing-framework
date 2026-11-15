@@ -9,13 +9,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ElementMetaData } from './ElementMetaData';
-import { IMetadataStore } from './IMetadataStore';
+import { IMetadataStore, mergeMetadata } from './IMetadataStore';
+import { writeFileAtomic } from './writeFileAtomic';
 
 export class JsonMetadataStore implements IMetadataStore {
   private readonly filePath: string;
   private readonly cache: Map<string, ElementMetaData> = new Map();
   private loaded = false;
-  private writes = 0;
+  /** Set when an unreadable file could not be moved aside: never overwrite it. */
+  private protectedCorruptFile = false;
+  /** Tail of the write queue: flushes run one at a time, in call order. */
+  private writing: Promise<void> = Promise.resolve();
 
   constructor(filePath: string) {
     this.filePath = path.resolve(filePath);
@@ -24,7 +28,7 @@ export class JsonMetadataStore implements IMetadataStore {
   public async load(): Promise<void> {
     if (this.loaded) return;
     if (!fs.existsSync(this.filePath)) {
-      await this.ensureDirectory();
+      await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
       this.loaded = true;
       return;
     }
@@ -44,8 +48,17 @@ export class JsonMetadataStore implements IMetadataStore {
       // Corrupt file: move it aside so the next flush cannot overwrite the
       // only copy, then continue empty rather than crashing the suite.
       const backup = `${this.filePath}.corrupt-${Date.now()}`;
-      await fs.promises.rename(this.filePath, backup);
-      console.warn(`[JsonMetadataStore] Unreadable metadata moved to ${backup}; starting empty.`);
+      try {
+        await fs.promises.rename(this.filePath, backup);
+        console.warn(`[JsonMetadataStore] Unreadable metadata moved to ${backup}; starting empty.`);
+      } catch (err) {
+        // e.g. a read-only checkout: stay usable, but never overwrite it.
+        this.protectedCorruptFile = true;
+        console.warn(
+          `[JsonMetadataStore] ${this.filePath} is unreadable and could not be backed up ` +
+            `(${(err as Error).message}); starting empty without overwriting it.`,
+        );
+      }
     }
     this.loaded = true;
   }
@@ -59,30 +72,23 @@ export class JsonMetadataStore implements IMetadataStore {
   }
 
   public async upsert(meta: ElementMetaData): Promise<void> {
-    const existing = this.cache.get(meta.logicalName);
-    const merged: ElementMetaData = existing
-      ? {
-          ...existing,
-          ...meta,
-          // Preserve the audit trail unless the incoming record extends it.
-          healedFrom: meta.healedFrom ?? existing.healedFrom,
-        }
-      : meta;
-    this.cache.set(meta.logicalName, merged);
+    this.cache.set(meta.logicalName, mergeMetadata(this.cache.get(meta.logicalName), meta));
     await this.flush();
   }
 
   public async flush(): Promise<void> {
-    await this.ensureDirectory();
-    const payload = JSON.stringify(Array.from(this.cache.values()), null, 2);
-    // Write-then-rename: a crash mid-write never leaves a truncated file.
-    const tmp = `${this.filePath}.${process.pid}-${++this.writes}.tmp`;
-    await fs.promises.writeFile(tmp, payload, 'utf-8');
-    await fs.promises.rename(tmp, this.filePath);
-  }
-
-  private async ensureDirectory(): Promise<void> {
-    const dir = path.dirname(this.filePath);
-    await fs.promises.mkdir(dir, { recursive: true });
+    if (this.protectedCorruptFile) {
+      throw new Error(
+        `[JsonMetadataStore] Refusing to overwrite unreadable ${this.filePath}; repair or remove it.`,
+      );
+    }
+    // Queue the write and snapshot the cache only when it starts: concurrent
+    // flushes could otherwise finish out of order, and an older snapshot
+    // landing last would drop records from disk.
+    const write = this.writing.then(() =>
+      writeFileAtomic(this.filePath, JSON.stringify(Array.from(this.cache.values()), null, 2)),
+    );
+    this.writing = write.catch(() => undefined);
+    await write;
   }
 }

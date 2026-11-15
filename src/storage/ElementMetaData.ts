@@ -26,7 +26,7 @@ export interface AnchorContext {
   siblingTexts: string[];
   /** ARIA-label on the element itself, if any. */
   ariaLabel?: string;
-  /** ARIA-role on the element itself, if any. */
+  /** ARIA-role on the element itself, if any. Recorded for diagnostics; not scored. */
   role?: string;
   /** `data-testid` attribute – the most stable signal when present. */
   dataTestId?: string;
@@ -60,10 +60,26 @@ export interface ElementMetaData {
   anchorContext: AnchorContext;
   /** ISO timestamp of the last successful capture. */
   capturedAt: string;
-  /** URL pathname so the same logical name can exist on multiple pages. */
+  /** URL pathname at capture time – diagnostics only. Stores are keyed by
+   *  logical name alone, so give elements on different pages distinct names. */
   pageUrlPattern?: string;
   /** Rolling audit log of selectors that previously pointed here. */
   healedFrom?: string[];
+}
+
+/**
+ * Everything needed to re-run a heal decision offline (`selfheal replay`).
+ */
+export interface HealReplay {
+  /** The stored fingerprint the engine scored against (pre-heal). */
+  meta: ElementMetaData;
+  /** The DOM the engine scored, exactly as serialised for it. */
+  dom: string;
+  /** The engine's pick in `toLocatorString` form; absent if it found none. */
+  engineSelector?: string;
+  /** True when embedding similarity shaped the decision – a lexical-only
+   *  replay cannot reproduce it. */
+  embeddings?: boolean;
 }
 
 /**
@@ -80,4 +96,7 @@ export interface HealingOutcome {
   reason?: string;
   durationMs: number;
   timestamp: string;
+  /** Present on every outcome produced after the DOM was read. */
+  // shortcut: DOM is inlined in the report JSON; move to sidecar files if reports grow large.
+  replay?: HealReplay;
 }

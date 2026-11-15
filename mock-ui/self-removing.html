@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Self-Healing Regression - Self-removing button</title>
+    <!--
+      Clicking "Delete row" removes the button and renders a look-alike
+      (same text and class, different id) for the next row – the shape of
+      every list-delete, modal-close and wizard-next button.
+
+      Regression guard: the fingerprint used to be captured AFTER the click.
+      With the button gone, that capture timed out, was mistaken for a
+      broken locator, and the "heal" clicked the look-alike: two deletes for
+      one call. window.__clicks counts every click.
+    -->
+  </head>
+  <body>
+    <div id="rows">
+      <p>Row 1</p>
+      <button id="del-1" class="danger-btn" type="button">Delete row</button>
+    </div>
+
+    <script>
+      window.__clicks = 0;
+      function wire(button, next) {
+        button.addEventListener('click', () => {
+          window.__clicks++;
+          const replacement = document.createElement('button');
+          replacement.id = `del-${next}`;
+          replacement.className = 'danger-btn';
+          replacement.type = 'button';
+          replacement.textContent = 'Delete row';
+          button.replaceWith(replacement);
+          wire(replacement, next + 1);
+        });
+      }
+      wire(document.getElementById('del-1'), 2);
+    </script>
+  </body>
+</html>
