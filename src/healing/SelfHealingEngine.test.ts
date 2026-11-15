@@ -6,7 +6,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { SelfHealingEngine } from './SelfHealingEngine';
+import * as cheerio from 'cheerio';
+import { SelfHealingEngine, toLocatorString } from './SelfHealingEngine';
+import { IEmbeddingProvider } from './IEmbeddingProvider';
 import { ElementMetaData } from '../storage/ElementMetaData';
 
 const metaFromOriginal = (): ElementMetaData => ({
@@ -204,5 +206,142 @@ describe('SelfHealingEngine.heal – custom weights', () => {
     const contextResult = await contextEngine.heal(MUTATED_DOM, meta);
 
     expect(contextResult.confidence).toBeGreaterThan(defaultResult.confidence);
+  });
+});
+
+const bareMeta = (over: Partial<ElementMetaData> = {}): ElementMetaData => ({
+  logicalName: 'el',
+  primarySelector: '#gone',
+  tagName: 'button',
+  classes: ['btn'],
+  textContent: 'Pay',
+  attributes: { class: 'btn' },
+  anchorContext: { siblingTexts: [] },
+  capturedAt: '2024-01-01T00:00:00.000Z',
+  ...over,
+});
+
+describe('SelfHealingEngine.heal – healed selectors point at the scored node', () => {
+  it('uses the first strategy that is unique in the DOM', async () => {
+    // Both buttons share the class; only the target has a unique `name`.
+    const dom = `<button class="btn" name="pay">Pay</button><button class="btn">Pay</button>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta({ attributes: { class: 'btn', name: 'pay' } }));
+    expect(result.candidate?.selector).toBe('button[name="pay"]');
+    expect(result.candidate?.nth).toBe(0);
+  });
+
+  it('adds the node index when no strategy is unique (look-alike twins)', async () => {
+    const dom = `
+      <div><span>Light total</span><button class="btn">Pay</button></div>
+      <div><span>Dark total</span><button class="btn">Pay</button></div>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta({ anchorContext: { siblingTexts: ['Dark total'] } }));
+    expect(result.candidate).toMatchObject({ selector: 'button.btn', nth: 1 });
+    expect(toLocatorString(result.candidate!)).toBe('button.btn >> nth=1');
+  });
+
+  it('escapes ids that start with a digit into valid CSS', async () => {
+    const dom = `<button id="1abc" class="btn">Pay</button><button class="btn">Back</button>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta());
+    expect(result.candidate?.selector).toBe('#\\31 abc');
+    expect(cheerio.load(dom)(result.candidate!.selector).length).toBe(1);
+  });
+
+  it('copes with quotes in ids during the label[for] lookup', async () => {
+    const dom = `<label for='mail"x'>Email</label><input id='mail"x' type="email">`;
+    const meta = bareMeta({ tagName: 'input', textContent: '', classes: [], attributes: { type: 'email' }, anchorContext: { siblingTexts: ['Email'], labelText: 'Email' } });
+    const result = await new SelfHealingEngine().heal(dom, meta);
+    expect(result.healed).toBe(true);
+    // A perfect anchor proves the label was found (without it: 0.6).
+    expect(result.candidate?.breakdown.anchor).toBe(1);
+  });
+
+  it('handles namespaced tag names that are not valid CSS as-is', async () => {
+    const dom = `<x:btn class="a">Pay</x:btn><x:btn class="b">Back</x:btn>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta({ tagName: 'x:btn', classes: ['a'], attributes: { class: 'a' } }));
+    expect(result.candidate?.selector).toBe('x\\:btn.a');
+    expect(cheerio.load(dom)(result.candidate!.selector).length).toBe(1);
+  });
+});
+
+describe('SelfHealingEngine.heal – relaxed scan', () => {
+  it('heals a re-tagged element even when other same-tag nodes remain', async () => {
+    const dom = `<div class="actions"><a id="submit-order" class="submit-btn" data-testid="checkout-submit">Submit Order</a><button id="cancel-order" class="cancel-btn">Cancel</button></div>`;
+    const result = await new SelfHealingEngine().heal(dom, metaFromOriginal());
+    expect(result.healed).toBe(true);
+    expect(result.candidate?.tagName).toBe('a');
+  });
+
+  it('breaks score ties toward the innermost node', async () => {
+    // Wrapper and child carry identical signals; the child is the real target.
+    const dom = `<div><span>Submit Order</span></div>`;
+    const result = await new SelfHealingEngine().heal(dom, bareMeta({ tagName: 'a', textContent: 'Submit Order', classes: [], attributes: {} }));
+    const [first, second] = result.topCandidates;
+    expect(first.score).toBe(second.score);
+    expect(first.tagName).toBe('span');
+  });
+});
+
+describe('SelfHealingEngine.heal – optional embeddings', () => {
+  // "Submit Order" and "Buy now" mean the same thing; "Cancel" does not.
+  const CONCEPTS: Record<string, number[]> = { 'Submit Order': [1, 0, 0], 'Buy now': [0.96, 0.1, 0.05], Cancel: [0, 1, 0] };
+  const fakeProvider = (impl?: (texts: string[]) => Promise<number[][]>) => {
+    const calls: string[][] = [];
+    const provider: IEmbeddingProvider = {
+      embed: async texts => {
+        calls.push(texts);
+        return impl ? impl(texts) : texts.map(t => CONCEPTS[t] ?? [0, 0, 1]);
+      },
+    };
+    return { provider, calls };
+  };
+  const DRIFT_DOM = `<div class="actions"><button id="x1" class="btn">Buy now</button><button id="x2" class="btn">Cancel</button></div>`;
+
+  it('rescues a semantic rewrite that lexical scoring rejects', async () => {
+    const lexical = await new SelfHealingEngine().heal(DRIFT_DOM, metaFromOriginal());
+    expect(lexical.healed).toBe(false);
+
+    const { provider, calls } = fakeProvider();
+    const semantic = await new SelfHealingEngine({ embeddings: { provider, weight: 0.8 } }).heal(DRIFT_DOM, metaFromOriginal());
+    expect(semantic.healed).toBe(true);
+    expect(semantic.embeddingsUsed).toBe(true);
+    expect(semantic.candidate?.textContent).toBe('Buy now');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe('Submit Order');
+    expect(new Set(calls[0]).size).toBe(calls[0].length); // deduplicated
+  });
+
+  it('keeps lexical scores and warns when the provider fails', async () => {
+    const lexical = await new SelfHealingEngine().heal(DRIFT_DOM, metaFromOriginal());
+    const { provider } = fakeProvider(async () => { throw new Error('connection refused'); });
+    const result = await new SelfHealingEngine({ embeddings: { provider } }).heal(DRIFT_DOM, metaFromOriginal());
+    expect(result.embeddingsUsed).toBe(false);
+    expect(result.confidence).toBe(lexical.confidence);
+    expect(result.warning).toMatch(/Embedding provider failed.*connection refused/);
+  });
+
+  it('rejects malformed vectors without failing the heal', async () => {
+    const { provider } = fakeProvider(async texts => texts.map(() => [Number.NaN]));
+    const result = await new SelfHealingEngine({ embeddings: { provider } }).heal(DRIFT_DOM, metaFromOriginal());
+    expect(result.warning).toMatch(/malformed vectors/);
+    expect(result.embeddingsUsed).toBe(false);
+  });
+
+  it('never calls the provider for elements without visible text', async () => {
+    const { provider, calls } = fakeProvider();
+    const meta = bareMeta({ tagName: 'input', textContent: '', classes: [], attributes: {} });
+    await new SelfHealingEngine({ embeddings: { provider } }).heal('<input name="q">', meta);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('leaves scores untouched without a provider', async () => {
+    const a = await new SelfHealingEngine().heal(MUTATED_DOM, metaFromOriginal());
+    expect(a.embeddingsUsed).toBe(false);
+    expect(a.warning).toBeUndefined();
+  });
+
+  it('rejects an embedding weight outside [0, 1]', () => {
+    const { provider } = fakeProvider();
+    expect(() => new SelfHealingEngine({ embeddings: { provider, weight: 1.5 } })).toThrow(/weight/);
+    expect(() => new SelfHealingEngine({ embeddings: { provider, weight: Number.NaN } })).toThrow(/weight/);
   });
 });

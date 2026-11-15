@@ -114,3 +114,32 @@ describe('SimilarityUtils.tokenize', () => {
     expect(SimilarityUtils.tokenize('CheckoutForm')).toEqual(['checkoutform']);
   });
 });
+
+describe('SimilarityUtils.cosine', () => {
+  it('returns 1 for identical and for scaled vectors', () => {
+    expect(SimilarityUtils.cosine([1, 2, 3], [1, 2, 3])).toBeCloseTo(1, 10);
+    expect(SimilarityUtils.cosine([1, 2, 3], [2, 4, 6])).toBeCloseTo(1, 10);
+  });
+
+  it('returns 0 for orthogonal vectors', () => {
+    expect(SimilarityUtils.cosine([1, 0], [0, 1])).toBe(0);
+  });
+
+  it('clamps opposite vectors to 0 instead of going negative', () => {
+    expect(SimilarityUtils.cosine([1, 0], [-1, 0])).toBe(0);
+  });
+
+  it('returns 0 for empty, zero or mismatched-length vectors', () => {
+    expect(SimilarityUtils.cosine([], [])).toBe(0);
+    expect(SimilarityUtils.cosine([0, 0], [1, 1])).toBe(0);
+    expect(SimilarityUtils.cosine([1, 2], [1, 2, 3])).toBe(0);
+  });
+
+  it('is symmetric and stays within [0, 1]', () => {
+    const a = [0.3, -0.2, 0.9];
+    const b = [0.1, 0.4, 0.7];
+    expect(SimilarityUtils.cosine(a, b)).toBe(SimilarityUtils.cosine(b, a));
+    expect(SimilarityUtils.cosine(a, b)).toBeGreaterThan(0);
+    expect(SimilarityUtils.cosine(a, b)).toBeLessThan(1);
+  });
+});
