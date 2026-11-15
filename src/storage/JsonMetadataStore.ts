@@ -9,7 +9,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ElementMetaData } from './ElementMetaData';
-import { IMetadataStore } from './IMetadataStore';
+import { IMetadataStore, mergeMetadata } from './IMetadataStore';
 
 export class JsonMetadataStore implements IMetadataStore {
   private readonly filePath: string;
@@ -59,16 +59,7 @@ export class JsonMetadataStore implements IMetadataStore {
   }
 
   public async upsert(meta: ElementMetaData): Promise<void> {
-    const existing = this.cache.get(meta.logicalName);
-    const merged: ElementMetaData = existing
-      ? {
-          ...existing,
-          ...meta,
-          // Preserve the audit trail unless the incoming record extends it.
-          healedFrom: meta.healedFrom ?? existing.healedFrom,
-        }
-      : meta;
-    this.cache.set(meta.logicalName, merged);
+    this.cache.set(meta.logicalName, mergeMetadata(this.cache.get(meta.logicalName), meta));
     await this.flush();
   }
 

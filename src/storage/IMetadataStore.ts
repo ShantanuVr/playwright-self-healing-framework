@@ -26,3 +26,17 @@ export interface IMetadataStore {
   /** Explicitly flush in-memory state to disk. */
   flush(): Promise<void>;
 }
+
+/**
+ * Upsert merge shared by every backend: the incoming record wins field by
+ * field, but the `healedFrom` audit trail is kept unless the incoming
+ * record extends it.
+ */
+export function mergeMetadata(
+  existing: ElementMetaData | undefined,
+  incoming: ElementMetaData,
+): ElementMetaData {
+  return existing
+    ? { ...existing, ...incoming, healedFrom: incoming.healedFrom ?? existing.healedFrom }
+    : incoming;
+}
