@@ -76,6 +76,9 @@ export interface HealReplay {
   dom: string;
   /** The engine's pick in `toLocatorString` form; absent if it found none. */
   engineSelector?: string;
+  /** True when embedding similarity shaped the decision – a lexical-only
+   *  replay cannot reproduce it. */
+  embeddings?: boolean;
 }
 
 /**

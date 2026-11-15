@@ -9,6 +9,7 @@ import { test as base } from '@playwright/test';
 import * as path from 'path';
 import { SmartPage } from '../src/core/SmartPage';
 import { SelfHealingEngine } from '../src/healing/SelfHealingEngine';
+import { HttpEmbeddingProvider } from '../src/healing/HttpEmbeddingProvider';
 import { JsonMetadataStore } from '../src/storage/JsonMetadataStore';
 import { SqliteMetadataStore } from '../src/storage/SqliteMetadataStore';
 import { IMetadataStore } from '../src/storage/IMetadataStore';
@@ -38,7 +39,28 @@ export const test = base.extend<HealingFixtures>({
   },
 
   engine: async ({}, use) => {
-    await use(new SelfHealingEngine());
+    // Opt-in Phase 5: blend embedding similarity from any OpenAI-compatible
+    // endpoint, e.g. a local Ollama at http://localhost:11434/v1/embeddings.
+    const url = process.env.SELFHEAL_EMBEDDINGS_URL;
+    await use(
+      new SelfHealingEngine(
+        url
+          ? {
+              embeddings: {
+                provider: new HttpEmbeddingProvider({
+                  url,
+                  model: process.env.SELFHEAL_EMBEDDINGS_MODEL ?? 'nomic-embed-text',
+                  apiKey: process.env.SELFHEAL_EMBEDDINGS_API_KEY,
+                }),
+                // Validated by the engine (must be in [0, 1]); default 0.5.
+                weight: process.env.SELFHEAL_EMBEDDINGS_WEIGHT
+                  ? Number(process.env.SELFHEAL_EMBEDDINGS_WEIGHT)
+                  : undefined,
+              },
+            }
+          : {},
+      ),
+    );
   },
 
   reporter: async ({}, use, testInfo) => {

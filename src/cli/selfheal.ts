@@ -115,11 +115,11 @@ const decision = (selector: string | undefined, confidence: number): string =>
     ? `HEALED ${confidence.toFixed(3)} -> ${selector}`
     : `NOT HEALED (best ${confidence.toFixed(3)})`;
 
-function replay(
+async function replay(
   inputs: string[],
   engine: SelfHealingEngine,
   out: Print,
-): number {
+): Promise<number> {
   let attempts = 0;
   let changed = 0;
   for (const { file, outcomes } of loadReports(inputs)) {
@@ -131,7 +131,7 @@ function replay(
 
       let result: HealResult;
       try {
-        result = engine.heal(rec.dom, rec.meta);
+        result = await engine.heal(rec.dom, rec.meta);
       } catch (err) {
         changed++;
         out(`ERROR    ${where}: ${(err as Error).message}`);
@@ -139,9 +139,13 @@ function replay(
       }
       const replayed = result.healed && result.candidate ? toLocatorString(result.candidate) : undefined;
       const same = replayed === rec.engineSelector;
-      if (!same) changed++;
+      // An embedding-assisted decision can't be reproduced lexically, so a
+      // difference there is expected and doesn't fail the run.
+      if (!same && !rec.embeddings) changed++;
 
-      out(`${same ? 'same   ' : 'CHANGED'}  ${where}`);
+      const status = rec.embeddings ? 'semantic' : same ? 'same   ' : 'CHANGED';
+      const note = rec.embeddings ? '  [semantic: not reproducible by lexical replay]' : '';
+      out(`${status}  ${where}${note}`);
       out(`   recorded : ${decision(rec.engineSelector, outcome.confidence)}`);
       out(`   replayed : ${decision(replayed, result.confidence)}`);
       result.topCandidates.forEach((c, i) => {
@@ -230,7 +234,8 @@ export async function main(
         weights: parseWeights(values.weights),
         topN: parseNumber('top', values.top, 0, 50, true),
       });
-      return replay(inputs, engine, out);
+      // `await` so a rejection (e.g. unreadable report) lands in the catch → exit 2.
+      return await replay(inputs, engine, out);
     }
 
     const outcomes = loadReports(inputs).flatMap(r => r.outcomes);
@@ -257,7 +262,7 @@ export async function main(
       out(new PrometheusExporter().render(outcomes).trimEnd());
       return 0;
     }
-    return runExports(targets, outcomes, out, err);
+    return await runExports(targets, outcomes, out, err);
   } catch (e) {
     err(`selfheal: ${(e as Error).message}\n${USAGE}`);
     return 2;
