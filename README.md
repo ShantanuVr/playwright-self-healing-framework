@@ -133,6 +133,35 @@ In your own fixtures, construct `new SqliteMetadataStore(path)`, call `load()` b
 
 ---
 
+## Healing replay CLI
+
+Every heal attempt in a report (`reports/*.json`) records what the engine saw: the stored fingerprint and the serialised DOM. `replay` re-runs the engine on that data offline, without a browser. You can see how a scoring or config change would have decided past heals:
+
+```bash
+npm run selfheal -- replay reports/                    # does today's engine still agree?
+npm run selfheal -- replay reports/ --threshold 0.7    # would a stricter threshold refuse a heal?
+npm run selfheal -- replay reports/heal-2-*.json --weights '{"text":0.35,"anchor":0.35}' --top 3
+```
+
+```
+same     checkout.submitButton  (heal-3-Text-drift-run-...json)
+   recorded : HEALED 0.662 -> #placeOrderBtn
+   replayed : HEALED 0.662 -> #placeOrderBtn
+     1. 0.662  #placeOrderBtn  text=0.50 tag=1.00 id=0.00 classes=0.67 attributes=1.00 anchor=0.85
+     2. 0.437  #abortBtn  text=0.08 tag=1.00 id=0.08 classes=0.25 attributes=1.00 anchor=0.85
+```
+
+Exit codes:
+- `0`: every decision is unchanged.
+- `1`: at least one decision changed. This makes it usable as a regression gate for scoring changes.
+- `2`: bad arguments or unreadable reports.
+
+`npm run selfheal` compiles with `tsc` first. Use `npm run build` and `node dist/src/cli/selfheal.js` to skip the rebuild.
+
+> **Reports contain page HTML.** Every heal attempt includes the DOM the engine scored. Reports stay local (`reports/` is gitignored) and the framework never sends them anywhere. Treat them like any other test artifact that may contain page content.
+
+---
+
 ## Architecture
 
 ```
@@ -199,6 +228,7 @@ src/
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
 ├── storage/JsonMetadataStore.ts  Default JSON-file backend
 ├── storage/SqliteMetadataStore.ts SQLite backend (node:sqlite, parallel-safe)
+├── cli/selfheal.ts               Healing-replay CLI over heal reports
 └── reporting/StateReporter.ts    Console summary + JSON report
 pages/CheckoutPage.ts             Sample Page Object
 mock-ui/{original,mutated,text-drift}.html  Fixture UIs with drifting selectors
@@ -231,10 +261,10 @@ new SelfHealingEngine({
 
 - [x] **Phase 1** — JSON store, 6-signal heuristic, CSS selector heal, mock UI demo
 - [x] **Phase 2** — XPath fallback, fresh-on-heal recapture, full Vitest harness, text-drift scenario
-- [ ] **Phase 3**
+- [x] **Phase 3**
   - [x] Shadow DOM scanning (open shadow roots)
   - [x] SQLite backend (`node:sqlite`, parallel-worker safe)
-  - [ ] Healing-replay CLI
+  - [x] Healing-replay CLI (`npm run selfheal -- replay reports/`)
 - [ ] **Phase 4** — Confidence telemetry exporter for Grafana / Datadog
 - [ ] **Phase 5** — Optional embedding-based similarity for semantic drift beyond Levenshtein
 

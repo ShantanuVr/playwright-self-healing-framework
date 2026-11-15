@@ -10,6 +10,8 @@
   "scripts": {
     "postinstall": "playwright install chromium",
     "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "selfheal": "tsc && node dist/src/cli/selfheal.js",
     "test": "npm run test:unit && npm run test:e2e",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",

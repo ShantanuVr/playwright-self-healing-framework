@@ -34,6 +34,7 @@ import { IMetadataStore } from '../storage/IMetadataStore';
 import {
   ElementMetaData,
   HealingOutcome,
+  HealReplay,
   AnchorContext,
 } from '../storage/ElementMetaData';
 import {
@@ -228,6 +229,8 @@ export class SmartPage {
   ): Promise<HealingOutcome> {
     const meta = this.store.get(logicalName);
     const timestamp = new Date().toISOString();
+    // Set once the DOM has been read, so every later outcome can be replayed.
+    let replay: HealReplay | undefined;
     const fail = (
       reason: string,
       confidence = 0,
@@ -241,6 +244,7 @@ export class SmartPage {
       reason,
       durationMs: 0,
       timestamp,
+      replay,
     });
 
     if (!meta) {
@@ -253,6 +257,7 @@ export class SmartPage {
     } catch (contentErr) {
       return fail(`Unable to read DOM: ${(contentErr as Error).message}`);
     }
+    replay = { meta, dom: domHtml };
 
     let result: HealResult;
     try {
@@ -262,6 +267,7 @@ export class SmartPage {
     }
 
     const candidate = result.candidate;
+    if (result.healed && candidate) replay.engineSelector = toLocatorString(candidate);
     if (!result.healed || !candidate) {
       return fail(
         `No DOM candidate met the confidence threshold. ` +
@@ -321,6 +327,7 @@ export class SmartPage {
           `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}${runnerUpNote}.`,
         durationMs: 0,
         timestamp,
+        replay,
       };
     }
 
