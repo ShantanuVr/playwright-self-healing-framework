@@ -116,7 +116,7 @@ npm install   # also downloads Chromium (postinstall)
 npm test
 ```
 
-On Ubuntu 26.04, `npm install` stops with `Playwright does not support chromium on ubuntu26.04-x64`: the locked Playwright 1.59 predates that release. Use Ubuntu 24.04, as CI does, until Playwright is upgraded.
+On Ubuntu 26.04, `npm install` stops with `Playwright does not support chromium on ubuntu26.04-x64`, because the locked Playwright 1.59 doesn't support that release. Use Ubuntu 24.04, as CI does, until Playwright is upgraded.
 
 Expected output, abridged (Vitest first, then Playwright):
 
@@ -144,7 +144,7 @@ The demo boots a tiny built-in static server (`scripts/serve-static.js`) on port
 
 ## Use it in your own suite
 
-The framework isn't published to npm. Copy `src/` into your project and add its one runtime dependency, `cheerio@1.0.0-rc.12`.
+The framework isn't published to npm. Copy `src/` into your project, leaving out the `*.test.ts` files unless you use Vitest, and add its one runtime dependency, `cheerio@1.0.0-rc.12`.
 
 **1. A fixture that gives each test a `SmartPage`.** [`tests/_fixtures.ts`](tests/_fixtures.ts) is the full version, with the SQLite and embedding switches.
 
