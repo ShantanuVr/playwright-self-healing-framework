@@ -16,7 +16,7 @@
 
 ## See it heal — in 30 seconds
 
-Same test. Four rewrites of the same page. **Zero maintenance.**
+Same test. Four versions of the same page. **Zero maintenance.**
 
 ```ts
 // The test – written once, never changed
@@ -28,20 +28,34 @@ await checkout.submit();
 |                         | `original.html`          | `mutated.html`        | `text-drift.html`   | `shadow-dom.html`              |
 | ----------------------- | ------------------------ | --------------------- | ------------------- | ------------------------------ |
 | submit button `id`      | `#submit-order`          | `#btn_a1b2c3d4`       | `#placeOrderBtn`    | `#place_k4`                    |
-| submit button `class`   | `submit-btn`             | `cta-btn primary-cta` | `cta-btn`           | `cta-btn`                      |
+| submit button `class`   | `submit-btn primary-action` | `cta-btn primary-cta` | `cta-btn`        | `cta-btn`                      |
 | visible text            | `Submit Order`           | `Submit Order`        | **`Place Order`**   | `Place Order`                  |
 | `data-testid`           | `checkout-submit`        | _(removed)_           | _(removed)_         | _(removed)_                    |
 | email label             | `Email address`          | `Email address`       | **`Email`**         | `Email`                        |
 | rendered in             | light DOM                | light DOM             | light DOM           | **a web component's shadow root** |
 
-Heal report produced by the actual test run in this repo:
+Every heal from the test run in this repo, one line each:
 
 ```
-[HEALED] checkout.submitButton  [data-testid="checkout-submit"] -> #btn_a1b2c3d4    conf 82.0%
-[HEALED] checkout.submitButton  #btn_a1b2c3d4                   -> #placeOrderBtn   conf 66.2%
-[HEALED] checkout.emailField    #email-field                    -> #emailAddr_9f3a  conf 87.5%
-[HEALED] checkout.emailField    #emailAddr_9f3a                 -> #email_q7        conf 81.8%
-[HEALED] checkout.submitButton  #placeOrderBtn                  -> #place_k4        conf 96.9%   (inside a shadow root)
+mutated.html     checkout.emailField    #email-field                     -> #emailAddr_9f3a   87.5%
+                 checkout.couponField   #coupon-field                    -> #promo_b21c       83.8%
+                 checkout.submitButton  [data-testid="checkout-submit"]  -> #btn_a1b2c3d4     82.0%
+text-drift.html  checkout.emailField    #emailAddr_9f3a                  -> #email_q7         81.8%
+                 checkout.couponField   #promo_b21c                      -> #promo_z9         83.9%
+                 checkout.submitButton  #btn_a1b2c3d4                    -> #placeOrderBtn    66.2%
+shadow-dom.html  checkout.emailField    #email_q7                        -> #mail_k2          98.1%
+                 checkout.couponField   #promo_z9                        -> #promo_k3         98.8%
+                 checkout.submitButton  #placeOrderBtn                   -> #place_k4         96.9%
+```
+
+The console report gives each heal its reason and the runner-up's score:
+
+```
+[HEALED] checkout.submitButton
+   from : #btn_a1b2c3d4
+   to   : #placeOrderBtn
+   conf : 66.2%
+   why  : Matched "Place Order" via CSS with score 0.662 (runner-up 0.437).
 ```
 
 Four DOMs, one test file, nine successful heals, and a full JSON audit trail for every decision.
@@ -98,31 +112,90 @@ Requires **Node.js 22.13 or newer**, the first release with built-in `node:sqlit
 ```bash
 git clone https://github.com/ShantanuVr/playwright-self-healing-framework.git
 cd playwright-self-healing-framework
-npm install
+npm install   # also downloads Chromium (postinstall)
 npm test
 ```
 
-Expected output:
+On Ubuntu 26.04, `npm install` stops with `Playwright does not support chromium on ubuntu26.04-x64`: the locked Playwright 1.59 predates that release. Use Ubuntu 24.04, as CI does, until Playwright is upgraded.
+
+Expected output, abridged (Vitest first, then Playwright):
 
 ```
-Test Files  6 passed (6)                                           Vitest
-     Tests  122 passed (122)
+ Test Files  6 passed (6)
+      Tests  122 passed (122)
 
- ✓ Regressions › an action that removes its own element runs exactly once  ( 0.1s)
- ✓ Regressions › readonly capture mode heals without writing the store     ( 1.2s)
- ✓ Regressions › an ambiguous XPath fallback is never used                 ( 2.1s)
- ✓ Regressions › a positional selector that drifted ... is re-healed       ( 1.1s)
- ✓ Regressions › the FIRST of several look-alikes is also stored by index  ( 1.1s)
- ✓ Regressions › a stored selector that turned ambiguous later is healed   ( 0.1s)
- ✓ 1. Seed run: captures metadata from the original UI                      ( 0.1s)
- ✓ 2. Heal run: recovers from full id/class mutation                        (12.2s)
- ✓ 3. Text-drift run: recovers when copy ALSO changes                       (12.2s)
- ✓ 4. Shadow DOM run: heals into an open shadow root                        (12.2s)
+  ✓  1 Regressions › an action that removes its own element runs exactly once (225ms)
+  ✓  2 Regressions › readonly capture mode heals without writing the store (1.1s)
+  ✓  3 Regressions › an ambiguous XPath fallback is never used (2.1s)
+  ✓  4 Regressions › a positional selector that drifted after a row insert is re-healed (1.2s)
+  ✓  5 Regressions › the FIRST of several look-alikes is also stored by index and re-healed (1.1s)
+  ✓  6 Regressions › a stored selector that turned ambiguous later is healed, not first-matched (87ms)
+  ✓  7 Self-Healing E2E Demo › 1. Seed run: captures metadata from the original UI (118ms)
+  ✓  8 Self-Healing E2E Demo › 2. Heal run: recovers from full id/class mutation (12.2s)
+  ✓  9 Self-Healing E2E Demo › 3. Text-drift run: recovers when button/label copy ALSO changes (12.2s)
+  ✓ 10 Self-Healing E2E Demo › 4. Shadow DOM run: heals into an open shadow root (12.2s)
 
-10 passed (43s)                                                             Playwright
+  10 passed (43.2s)
 ```
 
-The demo boots a tiny built-in static server (`scripts/serve-static.js`) on port `5555`, seeds metadata from `/original.html`, heals on `/mutated.html`, heals again on `/text-drift.html`, then follows the form into a web component's shadow root on `/shadow-dom.html`. Each heal takes about 12 s, almost all of it the 4 s action timeout expiring once per broken selector before healing starts.
+The demo boots a tiny built-in static server (`scripts/serve-static.js`) on port `5555` (override with `MOCK_UI_PORT`), seeds metadata from `/original.html`, heals on `/mutated.html`, heals again on `/text-drift.html`, then follows the form into a web component's shadow root on `/shadow-dom.html`. Each heal test takes about 12 s because its three broken selectors each wait out the 4 s action timeout before healing starts. The healing itself takes well under a second.
+
+---
+
+## Use it in your own suite
+
+The framework isn't published to npm. Copy `src/` into your project and add its one runtime dependency, `cheerio@1.0.0-rc.12`.
+
+**1. A fixture that gives each test a `SmartPage`.** [`tests/_fixtures.ts`](tests/_fixtures.ts) is the full version, with the SQLite and embedding switches.
+
+```ts
+// fixtures.ts
+import { test as base } from '@playwright/test';
+import { SmartPage } from './src/core/SmartPage';
+import { SelfHealingEngine } from './src/healing/SelfHealingEngine';
+import { JsonMetadataStore } from './src/storage/JsonMetadataStore';
+import { StateReporter } from './src/reporting/StateReporter';
+
+export const test = base.extend<{ smartPage: SmartPage }>({
+  smartPage: async ({ page }, use) => {
+    const store = new JsonMetadataStore('storage/element-metadata.json');
+    await store.load();
+    const reporter = new StateReporter('reports');
+    await use(new SmartPage(page, { store, engine: new SelfHealingEngine(), reporter }));
+    console.log(reporter.summary());
+    await reporter.writeToDisk(`heal-${Date.now()}.json`);
+  },
+});
+export { expect } from '@playwright/test';
+```
+
+**2. Address elements by logical name.** The name is the element's identity in the store, and the selector is only a hint:
+
+```ts
+import { test, expect } from './fixtures';
+
+test('checkout', async ({ smartPage }) => {
+  await smartPage.raw.goto('/checkout');
+  await smartPage.fill('checkout.email', 'alice@example.com', '#email');
+  await smartPage.click('checkout.submit', '[data-testid="checkout-submit"]');
+  await expect(smartPage.raw.locator('#status')).toHaveText('Order placed');
+});
+```
+
+| Call | What it does |
+| ---- | ------------ |
+| `click(name, hint?)`, `fill(name, value, hint?)` | Act on the element, healing first if its selector is broken |
+| `text(name, hint?)` | Return the element's `textContent` |
+| `expectVisible(name, hint?)` | Assert the element is visible |
+| `register(name, selector)` | Set a selector once instead of passing a hint on every call |
+| `raw` | The underlying Playwright `Page`, for navigation, assertions and anything not wrapped |
+
+- **The stored selector wins.** Each call tries the store's selector for that name first, then `register()`, then the hint. Once an element has a record, editing its hint changes nothing. Delete the record, or the store file, to re-seed it.
+- **Keep the store between runs.** A heal needs the fingerprint from an earlier passing run, so a fresh CI checkout with no store has nothing to heal from. This repo gitignores `storage/` only because the demo rebuilds it. In your suite, cache `storage/` between CI runs, or commit it. Every passing run refreshes the fingerprints' timestamps, so a committed store changes often.
+- **Options.**
+  - `SmartPage`: `defaultTimeoutMs` sets how long an action waits before healing starts (default 4,000). `captureMode` is `'auto'` (default) or `'readonly'`, which heals without writing the store.
+  - `SelfHealingEngine`: `threshold` (default 0.6), `weights`, `anchorWeights`, `topN` and `embeddings`. See [Extending](#extending) and [Semantic similarity](#semantic-similarity-optional-embeddings).
+- **One worker with the JSON store.** For parallel workers, use the SQLite backend below.
 
 ---
 
@@ -130,7 +203,7 @@ The demo boots a tiny built-in static server (`scripts/serve-static.js`) on port
 
 | Backend | Selected by | Notes |
 | ------- | ----------- | ----- |
-| JSON (default) | any other path, default `storage/element-metadata.json` | Human-readable and diffable in PRs. **Single writer**, so run one Playwright worker. |
+| JSON (default) | any other path, default `storage/element-metadata.json` | Human-readable and diffable. **Single writer**, so run one Playwright worker. |
 | SQLite | a path ending in `.db` or `.sqlite` | Built on Node's `node:sqlite`, no extra dependency. Safe for **parallel workers**: reads hit the database directly, so workers see each other's heals, and every upsert is a short `BEGIN IMMEDIATE` transaction under WAL with a 5 s busy timeout. |
 
 The demo fixtures read `SELFHEAL_STORE_PATH`:
@@ -244,9 +317,9 @@ The demo fixtures switch it on via env: `SELFHEAL_EMBEDDINGS_URL`, `SELFHEAL_EMB
   - At most two `embed()` calls per heal: one for the same-tag pass, and one more only if the scan has to widen. Each covers the stored text plus the unique texts of the top 50 lexical candidates (each clipped to 2,000 characters).
   - Elements stored by index (`>> nth=N`) are re-checked on every interaction, so with embeddings on, each such interaction makes a provider call too.
   - Elements without visible text, such as inputs, never trigger a call.
-- **Baseline matters.** Real models give *unrelated* short texts a cosine of roughly 0.3–0.6. Blending raw cosine would lift every wrong candidate toward the threshold, so similarity is rescaled above `baseline` (default `0.5`). Lower it for models with low baseline similarity, such as OpenAI `text-embedding-3` or MiniLM, and keep or raise it for high ones such as nomic or BGE.
+- **Baseline matters.** Embedding models typically give even *unrelated* short texts a cosine well above zero. Blending raw cosine would lift every wrong candidate toward the threshold, so similarity is rescaled above `baseline` (default `0.5`). The default is a starting point and has not been calibrated against a real model. To set it for yours, embed a few unrelated pairs of your UI's labels and put `baseline` near their cosine.
 - **Embeddings run before the scan widens.** A reworded element is blended within the same-tag pass, and the scan widens only if that still fails.
-- **Weight matters.** With the default `0.5`, a rewrite as heavy as "Submit Order" → "Buy now" is lifted (0.38 → 0.57 in our checks) but may not clear the 0.6 threshold on its own. Raising `w` to 0.7–0.8 heals it. Tune it on your own UI before relying on it.
+- **Weight matters.** In a unit test with hand-made vectors (cosine 0.99 between the two labels), the default `0.5` lifts "Submit Order" → "Buy now" from 0.38 to 0.56, still short of the 0.6 threshold, and `0.8` lifts it to 0.68, which heals. A real model will usually give such a pair a lower cosine, and so less lift. Tune `w` on your own UI before relying on it.
 - **Privacy.** Candidate texts are sent to the endpoint you configure. Point it at a local model if page copy must not leave the machine.
 - **Replay.** Embedding-assisted decisions are marked in reports. `selfheal replay` is lexical-only, so it labels them `semantic` instead of flagging them as changed.
 - **Interface.** Anything implementing `IEmbeddingProvider` (`embed(texts) → number[][]`) can be plugged in.
@@ -300,9 +373,9 @@ Storage sits behind the `IMetadataStore` interface. The engine and reporter are 
 | --------------------------------- | ---------------- | ------------------------ | -------------------------- |
 | Tests break on UI refactor        | always           | sometimes                | only below confidence floor |
 | Requires dev instrumentation      | no               | yes, perpetually         | no                         |
-| Flake rate from selector drift    | high             | medium                   | ~ 0                        |
+| Wrong-element risk on UI drift    | low              | low                      | higher: a look-alike can clear the threshold (see limitations) |
 | Per-run audit artifact            | none             | none                     | JSON heal report           |
-| External dependency / API key     | none             | none                     | none                       |
+| External dependency / API key     | none             | none                     | none by default            |
 | Setup cost                        | minimal          | ongoing                  | one-off                    |
 
 ---
@@ -319,6 +392,7 @@ src/
 ├── storage/IMetadataStore.ts     Storage abstraction (SOLID-DIP)
 ├── storage/JsonMetadataStore.ts  Default JSON-file backend
 ├── storage/SqliteMetadataStore.ts SQLite backend (node:sqlite, parallel-safe)
+├── storage/writeFileAtomic.ts    Temp file + rename, shared by the JSON store and the textfile export
 ├── cli/selfheal.ts               `replay` and `export` CLI over heal reports
 ├── telemetry/*Exporter.ts        Prometheus and Datadog confidence exporters
 ├── reporting/StateReporter.ts    Console summary + JSON report
@@ -326,6 +400,7 @@ src/
 pages/CheckoutPage.ts             Sample Page Object
 mock-ui/{original,mutated,text-drift,shadow-dom}.html  Fixture UIs with drifting selectors
 mock-ui/self-removing.html        Regression fixture (button that replaces itself)
+tests/_fixtures.ts                Fixtures that wire store, engine, reporter and SmartPage (start here)
 tests/self-healing.spec.ts        Seed -> Heal -> Text-Drift -> Shadow DOM e2e demo
 tests/regressions.spec.ts         Browser regression guards
 scripts/serve-static.js           Built-in static server for the mock UI (e2e)
@@ -342,7 +417,7 @@ Storage and embeddings sit behind interfaces, and the engine is configurable and
 // Add a shared remote backend: Redis / DynamoDB / Postgres
 class RedisStore implements IMetadataStore { /* ... */ }
 
-// Plug in any embedding model (see "Semantic similarity" below)
+// Plug in any embedding model (see "Semantic similarity" above)
 class MyEmbeddings implements IEmbeddingProvider { async embed(texts: string[]) { /* ... */ } }
 
 // heal() is async: it may await an embedding provider
@@ -380,7 +455,8 @@ new SelfHealingEngine({
 - The JSON store is single-writer. Run one Playwright worker (the default config does), or use the SQLite backend for parallel workers.
 - The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.
 - Re-capture on heal trusts the first accepted candidate. A post-test verification hook would close the false-positive window.
-- Elements without visible text, such as form inputs, all score a full 1.0 on the text signal against each other. A look-alike field can therefore clear the threshold if the real one disappears; in the demo, the coupon input scores 0.70 against the email fingerprint. Every heal reason records the runner-up score so these near-ties show up. A proper fix re-weights uninformative signals, and that needs a mutation benchmark first.
+- Elements without visible text, such as form inputs, all score a full 1.0 on the text signal against each other. A look-alike field can therefore clear the threshold if the real one disappears. In the demo, the other input on each page scores 0.70–0.78 against a field's fingerprint, above the 0.6 threshold. Every heal reason records the runner-up score so these near-ties show up. A proper fix re-weights uninformative signals, and that needs a mutation benchmark first.
+- The telemetry exporters and the embedding path have only been tested against local stand-ins. They follow the documented Pushgateway, Datadog and OpenAI-compatible formats, but have not run against a live Pushgateway, a Datadog account or a real embedding model.
 
 ---
 
