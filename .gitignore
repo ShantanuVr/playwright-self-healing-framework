@@ -3,6 +3,8 @@ dist/
 test-results/
 playwright-report/
 storage/*.json
+storage/*.tmp
+storage/*.corrupt-*
 reports/*.json
 .DS_Store
 *.log

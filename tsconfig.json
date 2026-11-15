@@ -19,15 +19,7 @@
     "declaration": true,
     "sourceMap": true,
     "outDir": "./dist",
-    "rootDir": "./",
-    "baseUrl": "./",
-    "paths": {
-      "@core/*":      ["src/core/*"],
-      "@healing/*":   ["src/healing/*"],
-      "@storage/*":   ["src/storage/*"],
-      "@reporting/*": ["src/reporting/*"],
-      "@pages/*":     ["pages/*"]
-    }
+    "rootDir": "./"
   },
   "include": [
     "src/**/*.ts",

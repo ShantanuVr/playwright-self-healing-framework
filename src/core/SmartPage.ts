@@ -12,8 +12,11 @@
  *                  error), hand the current DOM off to the
  *                  {@link SelfHealingEngine}, receive a healed selector,
  *                  retry the action, and persist the new selector.
- *               4. On every success, capture fresh {@link ElementMetaData}
- *                  so the "training data" stays in sync with production.
+ *               4. Snapshot the element's {@link ElementMetaData} just
+ *                  BEFORE each interaction and persist it once the
+ *                  interaction succeeds, so the "training data" stays in
+ *                  sync with production. Snapshotting first matters: an
+ *                  action may navigate away or remove its own element.
  *               5. Delegate logging to the {@link StateReporter} – this
  *                  class never prints or asserts on its own.
  *
@@ -33,7 +36,7 @@ import {
   HealingOutcome,
   AnchorContext,
 } from '../storage/ElementMetaData';
-import { SelfHealingEngine } from '../healing/SelfHealingEngine';
+import { SelfHealingEngine, HealResult } from '../healing/SelfHealingEngine';
 import { StateReporter } from '../reporting/StateReporter';
 
 export interface SmartPageOptions {
@@ -54,7 +57,7 @@ export interface SmartPageOptions {
 type InteractionFn = (locator: Locator) => Promise<void>;
 
 /**
- * Snapshot harvested from the browser during `captureMetadata`.
+ * Snapshot harvested from the browser just before an interaction.
  * Mirrors – but is NOT identical to – {@link ElementMetaData} because it
  * omits persistence-only fields (logicalName, primarySelector).
  */
@@ -65,6 +68,8 @@ interface DomSnapshot {
   textContent: string;
   attributes: Record<string, string>;
   anchor: AnchorContext;
+  /** Pathname at snapshot time – read before the action can navigate. */
+  pageUrlPattern: string;
 }
 
 export class SmartPage {
@@ -155,23 +160,11 @@ export class SmartPage {
     }
 
     const startedAt = Date.now();
+    const locator = this.page.locator(primary).first();
+    let snap: DomSnapshot | undefined;
     try {
-      const locator = this.page.locator(primary).first();
+      snap = this.captureMode === 'auto' ? await this.snapshot(locator) : undefined;
       await action(locator);
-      // Success – refresh the training data so future mutations can still heal.
-      if (this.captureMode === 'auto') {
-        await this.captureMetadata(logicalName, primary, locator);
-      }
-      this.reporter.record({
-        logicalName,
-        originalSelector: primary,
-        healedSelector: primary,
-        confidence: 1,
-        strategy: 'exact',
-        durationMs: Date.now() - startedAt,
-        timestamp: new Date().toISOString(),
-      });
-      return;
     } catch (err) {
       if (!this.isInteractionError(err)) throw err;
 
@@ -188,7 +181,21 @@ export class SmartPage {
           `${(err as Error).message}\n[SelfHealing] ${reason}`;
         throw err;
       }
+      return;
     }
+
+    // Persisting happens outside the try: a storage error must surface as
+    // itself, never be mistaken for a broken locator.
+    if (snap) await this.store.upsert(this.toMeta(logicalName, primary, snap));
+    this.reporter.record({
+      logicalName,
+      originalSelector: primary,
+      healedSelector: primary,
+      confidence: 1,
+      strategy: 'exact',
+      durationMs: Date.now() - startedAt,
+      timestamp: new Date().toISOString(),
+    });
   }
 
   private resolvePrimary(
@@ -206,7 +213,8 @@ export class SmartPage {
 
   /**
    * Try to recover a broken interaction by handing the current DOM to the
-   * healing engine. Always returns a {@link HealingOutcome} – never throws.
+   * healing engine. Every locator or engine problem is returned as a
+   * {@link HealingOutcome}; only storage errors propagate.
    */
   private async attemptHeal(
     logicalName: string,
@@ -215,50 +223,46 @@ export class SmartPage {
   ): Promise<HealingOutcome> {
     const meta = this.store.get(logicalName);
     const timestamp = new Date().toISOString();
+    const fail = (
+      reason: string,
+      confidence = 0,
+      healedSelector?: string,
+    ): HealingOutcome => ({
+      logicalName,
+      originalSelector: failedSelector,
+      healedSelector,
+      confidence,
+      strategy: 'failed',
+      reason,
+      durationMs: 0,
+      timestamp,
+    });
 
     if (!meta) {
-      return {
-        logicalName,
-        originalSelector: failedSelector,
-        confidence: 0,
-        strategy: 'failed',
-        reason:
-          'No historical metadata for this logical name – nothing to heal from.',
-        durationMs: 0,
-        timestamp,
-      };
+      return fail('No historical metadata for this logical name – nothing to heal from.');
     }
 
     let domHtml: string;
     try {
       domHtml = await this.page.content();
     } catch (contentErr) {
-      return {
-        logicalName,
-        originalSelector: failedSelector,
-        confidence: 0,
-        strategy: 'failed',
-        reason: `Unable to read page.content(): ${(contentErr as Error).message}`,
-        durationMs: 0,
-        timestamp,
-      };
+      return fail(`Unable to read page.content(): ${(contentErr as Error).message}`);
     }
 
-    const result = this.engine.heal(domHtml, meta);
+    let result: HealResult;
+    try {
+      result = this.engine.heal(domHtml, meta);
+    } catch (engineErr) {
+      return fail(`Healing engine error: ${(engineErr as Error).message}`);
+    }
 
     if (!result.healed || !result.selector) {
-      return {
-        logicalName,
-        originalSelector: failedSelector,
-        confidence: result.confidence,
-        strategy: 'failed',
-        reason:
-          `No DOM candidate met the confidence threshold. ` +
+      return fail(
+        `No DOM candidate met the confidence threshold. ` +
           `Best score=${result.confidence.toFixed(3)} ` +
           `across ${result.candidatesEvaluated} candidates.`,
-        durationMs: 0,
-        timestamp,
-      };
+        result.confidence,
+      );
     }
 
     // Try the primary (CSS) healed selector first; if that throws at click
@@ -273,63 +277,50 @@ export class SmartPage {
 
     let lastError: Error | undefined;
     for (const attempt of attempts) {
+      const healedLocator = this.page.locator(attempt.locatorExpr).first();
+      let snap: DomSnapshot | undefined;
       try {
-        const healedLocator = this.page.locator(attempt.locatorExpr).first();
+        // The fingerprint is re-captured from the healed node's CURRENT DOM
+        // state. Without this, anchor context (siblings, label, attributes)
+        // stays anchored to the original UI and each additional mutation
+        // would score against stale "training data".
+        snap = this.captureMode === 'auto' ? await this.snapshot(healedLocator) : undefined;
         await action(healedLocator);
-
-        // Refresh the stored fingerprint from the healed node's CURRENT
-        // DOM state. Without this, anchor context (siblings, label,
-        // attributes) remains anchored to the original UI and each
-        // additional mutation would score against stale "training data".
-        if (this.captureMode === 'auto') {
-          await this.captureMetadata(
-            logicalName,
-            attempt.locatorExpr,
-            healedLocator,
-          );
-        } else {
-          await this.store.upsert({
-            ...meta,
-            primarySelector: attempt.locatorExpr,
-            capturedAt: new Date().toISOString(),
-          });
-        }
-
-        // Append the broken selector to the rolling audit trail.
-        const refreshed = this.store.get(logicalName) ?? meta;
-        const healedFrom = Array.from(
-          new Set([...(refreshed.healedFrom ?? []), failedSelector]),
-        ).slice(-10);
-        await this.store.upsert({ ...refreshed, healedFrom });
-
-        return {
-          logicalName,
-          originalSelector: failedSelector,
-          healedSelector: attempt.locatorExpr,
-          confidence: result.confidence,
-          strategy: 'healed',
-          reason:
-            `Matched "${result.candidate?.textContent ?? ''}" ` +
-            `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}.`,
-          durationMs: 0,
-          timestamp,
-        };
       } catch (retryErr) {
         lastError = retryErr as Error;
+        continue;
       }
+
+      if (snap) {
+        // Append the broken selector to the rolling audit trail.
+        const healedFrom = Array.from(
+          new Set([...(meta.healedFrom ?? []), failedSelector]),
+        ).slice(-10);
+        await this.store.upsert({
+          ...this.toMeta(logicalName, attempt.locatorExpr, snap),
+          healedFrom,
+        });
+      }
+
+      return {
+        logicalName,
+        originalSelector: failedSelector,
+        healedSelector: attempt.locatorExpr,
+        confidence: result.confidence,
+        strategy: 'healed',
+        reason:
+          `Matched "${result.candidate?.textContent ?? ''}" ` +
+          `via ${attempt.kind.toUpperCase()} with score ${result.confidence.toFixed(3)}.`,
+        durationMs: 0,
+        timestamp,
+      };
     }
 
-    return {
-      logicalName,
-      originalSelector: failedSelector,
-      healedSelector: result.selector,
-      confidence: result.confidence,
-      strategy: 'failed',
-      reason:
-        `Healed selector(s) failed on retry: ${lastError?.message ?? 'unknown'}`,
-      durationMs: 0,
-      timestamp,
-    };
+    return fail(
+      `Healed selector(s) failed on retry: ${lastError?.message ?? 'unknown'}`,
+      result.confidence,
+      result.selector,
+    );
   }
 
   /**
@@ -351,95 +342,97 @@ export class SmartPage {
   // Metadata capture (browser-side evaluation)
   // --------------------------------------------------------------------
 
-  private async captureMetadata(
+  /**
+   * Harvest the element's fingerprint in the browser. Waits up to the
+   * action timeout for the locator to resolve, so a missing element fails
+   * here exactly like the action itself would.
+   */
+  private async snapshot(locator: Locator): Promise<DomSnapshot> {
+    return locator.evaluate(
+      (el): DomSnapshot => {
+        const node = el as HTMLElement;
+        const parent = node.parentElement;
+
+        // Attributes
+        const attrs: Record<string, string> = {};
+        for (const attr of Array.from(node.attributes)) {
+          attrs[attr.name] = attr.value;
+        }
+
+        // Sibling texts (non-empty only)
+        const siblingTexts: string[] = [];
+        if (parent) {
+          parent.childNodes.forEach((child) => {
+            if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
+            const t = (child as HTMLElement).innerText?.trim();
+            if (t) siblingTexts.push(t);
+          });
+        }
+
+        // Parent's OWN text (exclude descendants).
+        let parentText = '';
+        if (parent) {
+          parent.childNodes.forEach((child) => {
+            if (child.nodeType === Node.TEXT_NODE) {
+              parentText += ` ${child.textContent?.trim() ?? ''}`;
+            }
+          });
+          parentText = parentText.trim();
+        }
+
+        // Associated label (by `for=id` or by wrapping).
+        let labelText = '';
+        if (node.id) {
+          const forLabel = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+          if (forLabel) labelText = (forLabel.textContent ?? '').trim();
+        }
+        if (!labelText) {
+          const wrapping = node.closest('label');
+          if (wrapping) labelText = (wrapping.textContent ?? '').trim();
+        }
+
+        return {
+          tagName: node.tagName.toLowerCase(),
+          id: node.id || undefined,
+          classes: Array.from(node.classList),
+          textContent: (node.innerText ?? node.textContent ?? '').trim(),
+          attributes: attrs,
+          anchor: {
+            parentTag: parent?.tagName.toLowerCase(),
+            parentText,
+            siblingTexts,
+            ariaLabel: node.getAttribute('aria-label') ?? undefined,
+            role: node.getAttribute('role') ?? undefined,
+            dataTestId:
+              node.getAttribute('data-testid') ??
+              node.getAttribute('data-test') ??
+              undefined,
+            labelText: labelText || undefined,
+          },
+          pageUrlPattern: location.pathname,
+        };
+      },
+      undefined,
+      { timeout: this.timeout },
+    );
+  }
+
+  private toMeta(
     logicalName: string,
     selector: string,
-    locator: Locator,
-  ): Promise<void> {
-    const snapshot: DomSnapshot = await locator.evaluate((el): DomSnapshot => {
-      const node = el as HTMLElement;
-      const parent = node.parentElement;
-
-      // Attributes
-      const attrs: Record<string, string> = {};
-      for (const attr of Array.from(node.attributes)) {
-        attrs[attr.name] = attr.value;
-      }
-
-      // Sibling texts (non-empty only)
-      const siblingTexts: string[] = [];
-      if (parent) {
-        parent.childNodes.forEach((child) => {
-          if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
-          const t = (child as HTMLElement).innerText?.trim();
-          if (t) siblingTexts.push(t);
-        });
-      }
-
-      // Parent's OWN text (exclude descendants).
-      let parentText = '';
-      if (parent) {
-        parent.childNodes.forEach((child) => {
-          if (child.nodeType === Node.TEXT_NODE) {
-            parentText += ` ${child.textContent?.trim() ?? ''}`;
-          }
-        });
-        parentText = parentText.trim();
-      }
-
-      // Associated label (by `for=id` or by wrapping).
-      let labelText = '';
-      if (node.id) {
-        const forLabel = document.querySelector(`label[for="${node.id}"]`);
-        if (forLabel) labelText = (forLabel.textContent ?? '').trim();
-      }
-      if (!labelText) {
-        const wrapping = node.closest('label');
-        if (wrapping) labelText = (wrapping.textContent ?? '').trim();
-      }
-
-      return {
-        tagName: node.tagName.toLowerCase(),
-        id: node.id || undefined,
-        classes: Array.from(node.classList),
-        textContent: (node.innerText ?? node.textContent ?? '').trim(),
-        attributes: attrs,
-        anchor: {
-          parentTag: parent?.tagName.toLowerCase(),
-          parentText,
-          siblingTexts,
-          ariaLabel: node.getAttribute('aria-label') ?? undefined,
-          role: node.getAttribute('role') ?? undefined,
-          dataTestId:
-            node.getAttribute('data-testid') ??
-            node.getAttribute('data-test') ??
-            undefined,
-          labelText: labelText || undefined,
-        },
-      };
-    });
-
-    const pathname = (() => {
-      try {
-        return new URL(this.page.url()).pathname;
-      } catch {
-        return undefined;
-      }
-    })();
-
-    const meta: ElementMetaData = {
+    snap: DomSnapshot,
+  ): ElementMetaData {
+    return {
       logicalName,
       primarySelector: selector,
-      tagName: snapshot.tagName,
-      id: snapshot.id,
-      classes: snapshot.classes,
-      textContent: snapshot.textContent,
-      attributes: snapshot.attributes,
-      anchorContext: snapshot.anchor,
+      tagName: snap.tagName,
+      id: snap.id,
+      classes: snap.classes,
+      textContent: snap.textContent,
+      attributes: snap.attributes,
+      anchorContext: snap.anchor,
       capturedAt: new Date().toISOString(),
-      pageUrlPattern: pathname,
+      pageUrlPattern: snap.pageUrlPattern,
     };
-
-    await this.store.upsert(meta);
   }
 }
