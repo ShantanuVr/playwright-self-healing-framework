@@ -5,9 +5,8 @@
  *              written to a file for node_exporter's textfile collector.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import { HealingOutcome } from '../storage/ElementMetaData';
+import { writeFileAtomic } from '../storage/writeFileAtomic';
 import {
   ITelemetryExporter,
   METRIC_HELP,
@@ -65,13 +64,8 @@ export class PrometheusExporter implements ITelemetryExporter {
     const body = this.render(outcomes);
     const { pushgatewayUrl, filePath, job = 'selfheal' } = this.options;
 
-    if (filePath) {
-      // Write-then-rename: the textfile collector must never read a partial file.
-      await fs.promises.mkdir(path.dirname(path.resolve(filePath)), { recursive: true });
-      const tmp = `${filePath}.${process.pid}.tmp`;
-      await fs.promises.writeFile(tmp, body, 'utf-8');
-      await fs.promises.rename(tmp, filePath);
-    }
+    // Atomic: the textfile collector must never read a partial file.
+    if (filePath) await writeFileAtomic(filePath, body);
 
     if (pushgatewayUrl) {
       // `job@base64` lets any job name through, including ones with "/".

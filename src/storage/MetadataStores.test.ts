@@ -94,12 +94,13 @@ describe.each(backends)('%s – IMetadataStore contract', (_name, create, fileNa
 describe('JsonMetadataStore – crash safety', () => {
   const file = (): string => path.join(dir, 'meta.json');
 
-  it('leaves no temp files behind after writing', async () => {
+  it('keeps every record when upserts run concurrently, and leaves no temp files', async () => {
     const store = new JsonMetadataStore(file());
     await store.load();
-    await Promise.all([store.upsert(meta('a')), store.upsert(meta('b'))]);
+    // Unqueued flushes can finish out of order and let an older snapshot win.
+    await Promise.all(Array.from({ length: 20 }, (_, i) => store.upsert(meta(`el${i}`))));
     expect(fs.readdirSync(dir)).toEqual(['meta.json']);
-    expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toHaveLength(2);
+    expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toHaveLength(20);
   });
 
   it.each([
@@ -162,5 +163,26 @@ describe('SqliteMetadataStore – backend specifics', () => {
     const raw = new DatabaseSync(file());
     expect((raw.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode).toBe('wal');
     raw.close();
+  });
+});
+
+describe('JsonMetadataStore – unreadable file that cannot be moved aside', () => {
+  // chmod cannot stop root, and Windows has no POSIX directory modes.
+  const canRestrict = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+  it.skipIf(!canRestrict)('starts empty without crashing, and refuses to overwrite the file', async () => {
+    const file = path.join(dir, 'meta.json');
+    fs.writeFileSync(file, '{ truncated');
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    fs.chmodSync(dir, 0o555); // read-only directory: rename (backup) fails
+    try {
+      const store = new JsonMetadataStore(file);
+      await store.load();
+      expect(store.all()).toEqual([]);
+      await expect(store.upsert(meta('x'))).rejects.toThrow(/Refusing to overwrite/);
+    } finally {
+      fs.chmodSync(dir, 0o755);
+    }
+    expect(fs.readFileSync(file, 'utf-8')).toBe('{ truncated');
   });
 });

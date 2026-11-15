@@ -41,6 +41,7 @@ import {
   SelfHealingEngine,
   HealCandidate,
   HealResult,
+  SIBLING_WINDOW,
   toLocatorString,
 } from '../healing/SelfHealingEngine';
 import { StateReporter } from '../reporting/StateReporter';
@@ -166,28 +167,27 @@ export class SmartPage {
     }
 
     const startedAt = Date.now();
+    // A positional selector (`>> nth=N`) follows DOM order, not the element:
+    // once rows are inserted it silently points at a look-alike. Re-check it
+    // against the fingerprint before trusting it as an exact match.
+    if (primary.includes(' >> nth=') && (await this.positionalDrifted(logicalName, primary))) {
+      return this.recover(
+        logicalName,
+        primary,
+        action,
+        startedAt,
+        new Error(`Positional selector "${primary}" no longer points at the recorded element.`),
+      );
+    }
+
     const locator = this.page.locator(primary).first();
     let snap: DomSnapshot | undefined;
     try {
-      snap = this.captureMode === 'auto' ? await this.snapshot(locator) : undefined;
+      snap = await this.captureBefore(locator);
       await action(locator);
     } catch (err) {
       if (!this.isInteractionError(err)) throw err;
-
-      const outcome = await this.attemptHeal(logicalName, primary, action);
-      outcome.durationMs = Date.now() - startedAt;
-      this.reporter.record(outcome);
-
-      if (outcome.strategy === 'failed') {
-        // Re-throw a decorated version of the original error so users still
-        // see the full Playwright context (including trace), but with the
-        // healing diagnostics attached.
-        const reason = outcome.reason ?? 'unknown heal failure';
-        (err as Error).message =
-          `${(err as Error).message}\n[SelfHealing] ${reason}`;
-        throw err;
-      }
-      return;
+      return this.recover(logicalName, primary, action, startedAt, err as Error);
     }
 
     // Persisting happens outside the try: a storage error must surface as
@@ -202,6 +202,45 @@ export class SmartPage {
       durationMs: Date.now() - startedAt,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  /** Heal, record the outcome, and re-throw `err` (decorated) if healing failed. */
+  private async recover(
+    logicalName: string,
+    primary: string,
+    action: InteractionFn,
+    startedAt: number,
+    err: Error,
+  ): Promise<void> {
+    const outcome = await this.attemptHeal(logicalName, primary, action);
+    outcome.durationMs = Date.now() - startedAt;
+    this.reporter.record(outcome);
+
+    if (outcome.strategy === 'failed') {
+      // Re-throw a decorated version of the original error so users still
+      // see the full Playwright context (including trace), but with the
+      // healing diagnostics attached.
+      err.message = `${err.message}\n[SelfHealing] ${outcome.reason ?? 'unknown heal failure'}`;
+      throw err;
+    }
+  }
+
+  /**
+   * Does a positional primary still resolve to the element its fingerprint
+   * describes? Asks the engine on the live DOM: when it confidently picks a
+   * different match, the stored index has drifted. Costs one DOM read, and
+   * only for elements that never had a unique selector.
+   */
+  private async positionalDrifted(logicalName: string, primary: string): Promise<boolean> {
+    const meta = this.store.get(logicalName);
+    if (!meta) return false;
+    try {
+      const result = await this.engine.heal(await this.readDom(), meta);
+      if (!result.healed || !result.candidate) return false;
+      return (await this.playwrightLocator(result.candidate)) !== primary;
+    } catch {
+      return false; // can't check: keep trusting the stored selector, as before
+    }
   }
 
   private resolvePrimary(
@@ -293,6 +332,15 @@ export class SmartPage {
 
     let lastError: Error | undefined;
     for (const attempt of attempts) {
+      // Nothing proves the XPath is unique, and `.first()` would pick a
+      // look-alike: use it only when exactly one element matches.
+      if (
+        attempt.kind === 'xpath' &&
+        (await this.page.locator(attempt.locatorExpr).count().catch(() => 0)) !== 1
+      ) {
+        lastError = new Error(`XPath fallback ${attempt.locatorExpr} skipped: it does not match exactly one element.`);
+        continue;
+      }
       const healedLocator = this.page.locator(attempt.locatorExpr).first();
       let snap: DomSnapshot | undefined;
       try {
@@ -300,7 +348,7 @@ export class SmartPage {
         // state. Without this, anchor context (siblings, label, attributes)
         // stays anchored to the original UI and each additional mutation
         // would score against stale "training data".
-        snap = this.captureMode === 'auto' ? await this.snapshot(healedLocator) : undefined;
+        snap = await this.captureBefore(healedLocator);
         await action(healedLocator);
       } catch (retryErr) {
         lastError = retryErr as Error;
@@ -308,9 +356,11 @@ export class SmartPage {
       }
 
       if (snap) {
-        // Append the broken selector to the rolling audit trail.
+        // Append the broken selector to the rolling audit trail – read fresh,
+        // so a parallel worker's entries are extended rather than dropped.
+        const current = this.store.get(logicalName) ?? meta;
         const healedFrom = Array.from(
-          new Set([...(meta.healedFrom ?? []), failedSelector]),
+          new Set([...(current.healedFrom ?? []), failedSelector]),
         ).slice(-10);
         await this.store.upsert({
           ...this.toMeta(logicalName, attempt.locatorExpr, snap),
@@ -404,6 +454,10 @@ export class SmartPage {
       const doc = document.implementation.createHTMLDocument('');
       // shortcut: <slot> content is not distributed (shadow children precede
       // light children); use assignedNodes() if slotted elements score poorly.
+      // shortcut: the engine re-parses this markup with HTML repair rules, so
+      // shadow content the parser would restructure (block elements inside a
+      // <p> host, custom elements in table context) scores with shifted
+      // context; serialise a node tree instead of HTML if that ever matters.
       const flat = (n: Node): Node => {
         const copy = doc.importNode(n, false);
         if (n instanceof Element && n.shadowRoot) {
@@ -417,13 +471,29 @@ export class SmartPage {
   }
 
   /**
+   * Snapshot before an action (auto mode only). A locator error – element
+   * missing – is re-thrown so healing kicks in. Anything else, e.g. the
+   * execution context being replaced mid-navigation, skips this one capture
+   * and leaves the action's own auto-waiting to cope.
+   */
+  private async captureBefore(locator: Locator): Promise<DomSnapshot | undefined> {
+    if (this.captureMode !== 'auto') return undefined;
+    try {
+      return await this.snapshot(locator);
+    } catch (err) {
+      if (this.isInteractionError(err)) throw err;
+      return undefined;
+    }
+  }
+
+  /**
    * Harvest the element's fingerprint in the browser. Waits up to the
    * action timeout for the locator to resolve, so a missing element fails
    * here exactly like the action itself would.
    */
   private async snapshot(locator: Locator): Promise<DomSnapshot> {
     return locator.evaluate(
-      (el): DomSnapshot => {
+      (el, siblingWindow): DomSnapshot => {
         const node = el as HTMLElement;
         // Mirror the engine's flattened view (see readDom): a top-level node
         // of a shadow root belongs to the host, and a host's children are its
@@ -440,13 +510,16 @@ export class SmartPage {
           attrs[attr.name] = attr.value;
         }
 
-        // Sibling texts (non-empty only)
-        const siblingTexts: string[] = [];
-        kids.forEach((child) => {
-          if (child === node || child.nodeType !== Node.ELEMENT_NODE) return;
-          const t = (child as HTMLElement).innerText?.trim();
-          if (t) siblingTexts.push(t);
-        });
+        // Sibling texts (non-empty): the nearest `siblingWindow` element
+        // siblings on each side – the same window the engine scores with.
+        const elementKids = kids.filter(child => child.nodeType === Node.ELEMENT_NODE);
+        const at = elementKids.indexOf(node);
+        const siblingTexts = [
+          ...elementKids.slice(Math.max(0, at - siblingWindow), at),
+          ...elementKids.slice(at + 1, at + 1 + siblingWindow),
+        ]
+          .map(child => (child as HTMLElement).innerText?.trim())
+          .filter((t): t is string => !!t);
 
         // Parent's OWN text (exclude descendants).
         let parentText = '';
@@ -490,7 +563,7 @@ export class SmartPage {
           pageUrlPattern: location.pathname,
         };
       },
-      undefined,
+      SIBLING_WINDOW,
       { timeout: this.timeout },
     );
   }
