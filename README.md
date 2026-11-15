@@ -59,7 +59,7 @@ This project accepts that **selector drift is inevitable** and designs around it
 
 ## How it works
 
-On first contact with an element, the wrapper captures a **semantic fingerprint**:
+Just before every interaction (in the default `auto` capture mode), the wrapper snapshots a **semantic fingerprint** of the element, and persists it once the interaction succeeds. Snapshotting first means an action that navigates away or removes its own element is still recorded:
 
 - tag, id, every class, every attribute
 - visible text (`normalize-space`)
@@ -82,7 +82,7 @@ When a later run's primary selector times out, the engine takes over:
 
 3. Accepts the top candidate iff its blended score clears the threshold (default `0.6`).
 4. Emits **both** a CSS selector and an XPath — the latter with `normalize-space(text())='...'` for buttons/links/labels, which CSS cannot express.
-5. **Re-captures** the fingerprint from the healed node, so the next mutation scores against up-to-date data instead of the original snapshot.
+5. **Re-captures** the fingerprint from the healed node, so the next mutation scores against up-to-date data instead of the original snapshot. In `readonly` capture mode nothing is written. The heal still happens, but the store is left untouched.
 
 No LLMs, no API keys, no remote service. Every decision is reproducible and inspectable.
 
@@ -138,7 +138,7 @@ The demo boots a local `http-server` on port `5555`, seeds metadata from `/origi
                           +-----------------+
 ```
 
-Every edge above is an **interface**, not a concrete class — swap storage, swap similarity metric, swap reporter, and the orchestration code does not change.
+Storage sits behind the `IMetadataStore` interface. The engine and reporter are plain classes injected into `SmartPage`, so you can subclass or replace either one without touching the orchestration code.
 
 ---
 
@@ -147,7 +147,7 @@ Every edge above is an **interface**, not a concrete class — swap storage, swa
 - **Zero-LLM, deterministic healing.** Every heal is replayable and inspectable.
 - **Dual selector output.** CSS first; XPath fallback retried at click time if CSS becomes ambiguous.
 - **Strict TypeScript.** `"strict": true`, no `any` escapes, no unused locals/parameters.
-- **SOLID decomposition.** `IMetadataStore`, `SelfHealingEngine`, `StateReporter`, `SmartPage` all swappable via interfaces.
+- **SOLID decomposition.** `IMetadataStore` abstracts storage. `SelfHealingEngine` and `StateReporter` are injected collaborators, so each can be subclassed or swapped.
 - **POM-friendly.** Drop into any Page Object suite — supply logical names and optional hints, nothing else.
 - **Full audit trail.** Every interaction logged to console + persisted as JSON with per-signal breakdown, confidence, before/after selector.
 - **35 unit tests and 3 browser scenarios, < 30 s total run.** Engine correctness is not trust-me-bro.
@@ -220,6 +220,8 @@ new SelfHealingEngine({
 
 - Shadow DOM / cross-origin iframes are not scanned — cheerio parses `page.content()` only.
 - Metadata lives on disk per checkout; a remote backend (SQLite / Redis) is still a Phase 3 item.
+- The JSON store is single-writer. Run one Playwright worker (the default config does); parallel workers would overwrite each other's records.
+- The JSON store writes atomically (temp file + rename). If it ever finds a corrupt file, it moves it aside as `*.corrupt-<timestamp>` instead of overwriting it.
 - Re-capture on heal trusts the first accepted candidate. A post-test verification hook would close the false-positive window.
 
 ---

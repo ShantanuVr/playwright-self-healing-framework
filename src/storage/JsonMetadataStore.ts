@@ -15,6 +15,7 @@ export class JsonMetadataStore implements IMetadataStore {
   private readonly filePath: string;
   private readonly cache: Map<string, ElementMetaData> = new Map();
   private loaded = false;
+  private writes = 0;
 
   constructor(filePath: string) {
     this.filePath = path.resolve(filePath);
@@ -29,13 +30,22 @@ export class JsonMetadataStore implements IMetadataStore {
     }
 
     const raw = await fs.promises.readFile(this.filePath, 'utf-8');
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(raw) as ElementMetaData[];
-      if (Array.isArray(parsed)) {
-        for (const entry of parsed) this.cache.set(entry.logicalName, entry);
-      }
+      parsed = JSON.parse(raw);
     } catch {
-      // Corrupt file – treat as empty rather than crashing the suite.
+      parsed = undefined;
+    }
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed as ElementMetaData[]) {
+        if (typeof entry?.logicalName === 'string') this.cache.set(entry.logicalName, entry);
+      }
+    } else {
+      // Corrupt file: move it aside so the next flush cannot overwrite the
+      // only copy, then continue empty rather than crashing the suite.
+      const backup = `${this.filePath}.corrupt-${Date.now()}`;
+      await fs.promises.rename(this.filePath, backup);
+      console.warn(`[JsonMetadataStore] Unreadable metadata moved to ${backup}; starting empty.`);
     }
     this.loaded = true;
   }
@@ -65,7 +75,10 @@ export class JsonMetadataStore implements IMetadataStore {
   public async flush(): Promise<void> {
     await this.ensureDirectory();
     const payload = JSON.stringify(Array.from(this.cache.values()), null, 2);
-    await fs.promises.writeFile(this.filePath, payload, 'utf-8');
+    // Write-then-rename: a crash mid-write never leaves a truncated file.
+    const tmp = `${this.filePath}.${process.pid}-${++this.writes}.tmp`;
+    await fs.promises.writeFile(tmp, payload, 'utf-8');
+    await fs.promises.rename(tmp, this.filePath);
   }
 
   private async ensureDirectory(): Promise<void> {
